@@ -57,7 +57,12 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-from distutils.core import setup, Extension
+try:
+    # setuptools is preferred and is the only option on Python 3.12+,
+    # where distutils was removed from the standard library.
+    from setuptools import setup, Extension
+except ImportError:
+    from distutils.core import setup, Extension
 import shutil
 import sys
 
