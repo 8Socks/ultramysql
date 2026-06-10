@@ -77,12 +77,29 @@ The I/O mechanism (driving a Python `socket` object) is unchanged, and was
 measured cooperative on py2 (10 concurrent `SELECT SLEEP(0.5)` complete in
 ~0.5s, not 5s). Re-confirm empirically on py3 with gevent installed.
 
+## Edge-case test suite (`tests/test_py3_port.py`)
+
+A 79-test suite covering type decoding (every MySQL type incl. JSON/BIT/SET/
+unsigned boundaries), py3 str/bytes boundaries, param escaping + SQL-injection,
+connection/charset/auth lifecycle, ResultSet/protocol edges, gevent concurrency,
+and refcount/leak behavior on the rewritten paths. Runs green on both py2.7
+(gevent active -> the 7 concurrency tests execute) and py3.9 (those 7 skip).
+
+Authoring it surfaced and fixed three real defects:
+- **BIT/GEOMETRY decoded as text** -> on py3 a non-ASCII byte (e.g. `BIT(8)=0xFF`)
+  raised `UnicodeDecodeError`. These binary types now decode to `bytes`.
+- **JSON (type 245) unhandled** -> a direct `SELECT` of a JSON column raised
+  "Unable to convert field of type 245". JSON now decodes as text (`str` on py3).
+- **Output-buffer overflow** -> non-string params reserved a fixed 64 bytes in
+  `EscapeQueryArguments`, so a >64-char rendering (huge int / high-precision
+  `Decimal`) overflowed the buffer. The estimate is now sized from the value.
+
 ## Known limitations / follow-ups
 
-- `GEOMETRY`/`BIT` columns fall through the textual decode path and would raise
-  on non-UTF-8 bytes on py3 (these binary types are uncommon; decode them as
-  `bytes` if needed).
 - Tested against `mysql_native_password` on MySQL 8. `caching_sha2_password`
   (MySQL 8 default for new users) is not implemented by this driver and is a
   separate piece of work if required.
-- py3+gevent concurrency benchmark still to be run in a gevent-enabled env.
+- A `>65`-digit numeric literal sent to MySQL 8 hangs on py2 (the recv path);
+  this reproduces on the *original* umysql too (pre-existing, not a port issue).
+- py3+gevent concurrency benchmark still to be run in a gevent-enabled env (the
+  cooperation property itself is verified on py2).

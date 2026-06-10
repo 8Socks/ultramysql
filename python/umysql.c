@@ -671,13 +671,21 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
       valobj = DecodeString (ti, value, cbValue);
       break;
 
-    case MFTYPE_ENUM:
     case MFTYPE_GEOMETRY:
     case MFTYPE_BIT:
+      // Binary types: BIT is packed big-endian bytes, GEOMETRY is WKB. Neither is
+      // valid text, so they must NOT be UTF-8 decoded -- doing so raises
+      // UnicodeDecodeError on py3 for any non-ASCII byte (e.g. BIT(8)=0xFF).
+      valobj = PyBytes_FromStringAndSize( (const char *) value, cbValue);
+      break;
+
+    case MFTYPE_ENUM:
     case MFTYPE_NEWDECIMAL:
     case MFTYPE_SET:
     case MFTYPE_DECIMAL:
-      // Fall through for string encoding (DECIMAL/ENUM/SET are textual -> str on py3)
+    case MFTYPE_JSON:
+      // Textual types -> str on py3, bytes on py2. JSON (MySQL 8, type 0xf5)
+      // arrives as UTF-8 JSON text; decode it like any other text column.
       valobj = UM_NATIVE_STR_N( (const char *) value, cbValue);
       break;
 
@@ -1088,7 +1096,28 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
       if (PyUnicode_Check(arg))
         cbOutQuery += (UM_UNICODE_LEN(arg) * 6);
       else
-        cbOutQuery += 64;
+      {
+        /* Non-string args are rendered via PyObject_Str in AppendEscapedArg. A
+           huge int or high-precision Decimal far exceeds any fixed guess, so a
+           constant 64-byte reservation here is an output-buffer overflow. Size
+           from the actual string form instead (x2 for escaping + margin). */
+        PyObject *strtmp = PyObject_Str(arg);
+        if (strtmp == NULL)
+        {
+          PyErr_Clear();
+          cbOutQuery += 64;
+        }
+        else
+        {
+#if PY_MAJOR_VERSION >= 3
+          Py_ssize_t slen = PyUnicode_GET_LENGTH(strtmp);
+#else
+          Py_ssize_t slen = PyBytes_GET_SIZE(strtmp);
+#endif
+          cbOutQuery += (slen * 2) + 16;
+          Py_DECREF(strtmp);
+        }
+      }
 
     Py_DECREF(arg);
   }
