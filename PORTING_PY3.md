@@ -80,8 +80,8 @@ measured cooperative on py2 (10 concurrent `SELECT SLEEP(0.5)` complete in
 ## Known limitations / follow-ups
 
 - `GEOMETRY`/`BIT` columns fall through the textual decode path and would raise
-  on non-UTF-8 bytes on py3 (these types are unused by the target app; decode
-  them as `bytes` if needed).
+  on non-UTF-8 bytes on py3 (these binary types are uncommon; decode them as
+  `bytes` if needed).
 - Tested against `mysql_native_password` on MySQL 8. `caching_sha2_password`
   (MySQL 8 default for new users) is not implemented by this driver and is a
   separate piece of work if required.
