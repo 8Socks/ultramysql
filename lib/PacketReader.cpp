@@ -231,8 +231,17 @@ void PacketReader::rewind(size_t num)
 
 UINT8 *PacketReader::readLengthCodedBinary(size_t *_outLen)
 {
-  assert (m_readCursor < m_packetEnd);
+  // Untrusted input. The asserts below are stripped under NDEBUG (the normal
+  // release/pip build), so every read is validated against the packet end at
+  // runtime here. A malformed/hostile packet yields NULL/truncated data rather
+  // than an out-of-bounds read (memory disclosure / crash).
   assert (m_packetEnd <= m_writeCursor);
+
+  if (m_readCursor >= m_packetEnd)
+  {
+    *_outLen = 0;
+    return NULL;
+  }
 
   switch (*((UINT8 *) m_readCursor))
   {
@@ -247,29 +256,40 @@ UINT8 *PacketReader::readLengthCodedBinary(size_t *_outLen)
     return NULL;
 
   case 252:
+    if (m_readCursor + 3 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT16 *) m_readCursor);
-    m_readCursor += 2; 
+    m_readCursor += 2;
     break;
 
   case 253:
+    if (m_readCursor + 4 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT32 *) m_readCursor);
     *_outLen &= 0xffffff;
-    m_readCursor += 3; 
+    m_readCursor += 3;
     break;
 
   case 254:
+    if (m_readCursor + 9 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT64 *) m_readCursor);
-    m_readCursor += 8; 
+    m_readCursor += 8;
     break;
+  }
+
+  // Clamp the payload length to the bytes actually remaining in the packet, so
+  // the returned (pointer, length) can never reference memory past m_packetEnd.
+  {
+    size_t avail = (size_t) (m_packetEnd - m_readCursor);
+    if (*_outLen > avail)
+    {
+      *_outLen = avail;
+    }
   }
 
   UINT8 *ret = (UINT8*) m_readCursor;
   m_readCursor += (*_outLen);
-
-  assert (m_readCursor <= m_packetEnd);
 
   return ret;
 }

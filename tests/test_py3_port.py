@@ -1468,6 +1468,44 @@ class PortEdgeCases(unittest.TestCase):
         assert val == u'still_alive', repr(val)
         c.close()
 
+    def test_security__param_multibyte_str_no_overflow(self):
+        # Regression: a non-str/bytes param whose str() is long multibyte text used
+        # to under-size the escape buffer (estimate counted code points; the write
+        # encodes UTF-8 bytes -> heap/stack overflow). Must round-trip, no crash.
+        if not PY3:
+            return
+        class Big(object):
+            def __str__(self):
+                return u'\U0001F600' * 5000   # 4-byte codepoints -> 20000 UTF-8 bytes
+        c = conn()
+        # The str() fallback renders the value unquoted, so MySQL rejects it as a
+        # bad column reference -- the point is that building the 20000-byte query
+        # does NOT overflow the escape buffer (was a heap/stack smash). No crash.
+        try:
+            c.query('SELECT %s', (Big(),))
+        except umysql.SQLError:
+            pass
+        assert c.query('SELECT 1').rows == [(1,)]   # connection intact (no corruption)
+        c.close()
+
+    def test_security__param_toctou_str_no_overflow(self):
+        # Regression: a param whose str() returns different lengths across the
+        # sizing vs writing calls must not overflow -- the bounded writer fails the
+        # query cleanly instead of corrupting memory.
+        class Toctou(object):
+            n = 0
+            def __str__(self):
+                Toctou.n += 1
+                return 'A' if Toctou.n == 1 else 'A' * 200000
+        c = conn()
+        try:
+            c.query('SELECT %s', (Toctou(),))
+        except Exception:
+            pass   # may raise; the point is no crash / no corruption
+        assert c.query('SELECT 1').rows == [(1,)]   # connection still usable
+        c.close()
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -586,6 +586,13 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
         int month;
         int day;
 
+        if (cbValue < 10)   /* "YYYY-MM-DD"; reject a short server value (OOB read) */
+        {
+          valobj = Py_None;
+          Py_IncRef(valobj);
+          break;
+        }
+
         year = parseINT32 (value, value + 4);
 
         if (year < 1)
@@ -615,10 +622,17 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
         int minute;
         int second;
 
-        //9999-12-31 23:59:59
-        char temp[20];
-        memcpy (temp, value, cbValue);
-        temp[cbValue] = '\0';
+        //9999-12-31 23:59:59 (19 chars). The value is parsed directly from
+        //`value` below. Reject a short/oversized server value instead of the old
+        //`char temp[20]; memcpy(temp, value, cbValue)` -- that copy was never even
+        //read, yet a server-controlled cbValue>19 made it a remotely-triggerable
+        //stack buffer overflow.
+        if (cbValue < 19)
+        {
+          valobj = Py_None;
+          Py_IncRef(valobj);
+          break;
+        }
 
         year = parseINT32 (value, value + 4);
         value += 5;
@@ -919,11 +933,17 @@ int AppendAndEscapeString(char *buffStart, char *buffEnd, const char *strStart, 
 
   if (quote)
   {
+    if (buffOffset >= buffEnd) return -1;
     (*buffOffset++) = '\'';
   }
 
   while (strStart < strEnd)
   {
+    /* Each branch writes at most 2 bytes. Bound-check before every iteration so
+       an undersized output buffer can never be overflowed: return -1 and the
+       caller fails the query. Defense-in-depth against any size-estimate error
+       (incl. a side-effecting __str__ that changes between sizing and writing). */
+    if (buffOffset + 2 > buffEnd) return -1;
     switch (*strStart)
     {
     case '\0':	// NULL
@@ -972,6 +992,7 @@ int AppendAndEscapeString(char *buffStart, char *buffEnd, const char *strStart, 
 
   if (quote)
   {
+    if (buffOffset >= buffEnd) return -1;
     (*buffOffset++) = '\'';
   }
 
@@ -1051,6 +1072,7 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
           //FIXME: Might possible to avoid this?
           PRINTMARK();
           strobj = PyObject_Str(obj);
+          if (strobj == NULL) return -1;   /* a param whose __str__ raises must not NULL-deref */
 #if PY_MAJOR_VERSION >= 3
           /* py3 str(obj) is unicode -- encode to bytes for the byte buffer */
           {
@@ -1097,10 +1119,12 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
         cbOutQuery += (UM_UNICODE_LEN(arg) * 6);
       else
       {
-        /* Non-string args are rendered via PyObject_Str in AppendEscapedArg. A
-           huge int or high-precision Decimal far exceeds any fixed guess, so a
-           constant 64-byte reservation here is an output-buffer overflow. Size
-           from the actual string form instead (x2 for escaping + margin). */
+        /* Non-string args are rendered via PyObject_Str in AppendEscapedArg (and
+           UTF-8/charset-encoded on py3). Size the reservation from the actual
+           ENCODED byte length (x2 worst-case escaping + margin), NOT the
+           code-point count -- a multibyte str() is more bytes than code points.
+           AppendAndEscapeString is hard-bounded too, so this is just the fast
+           path; the bound is the backstop if str() is non-deterministic. */
         PyObject *strtmp = PyObject_Str(arg);
         if (strtmp == NULL)
         {
@@ -1109,12 +1133,15 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
         }
         else
         {
+          Py_ssize_t nbytes;
 #if PY_MAJOR_VERSION >= 3
-          Py_ssize_t slen = PyUnicode_GET_LENGTH(strtmp);
+          PyObject *enc = PyUnicode_AsEncodedString(strtmp, self->charset_name, "strict");
+          if (enc == NULL) { PyErr_Clear(); nbytes = PyUnicode_GET_LENGTH(strtmp) * 4; }
+          else { nbytes = PyBytes_GET_SIZE(enc); Py_DECREF(enc); }
 #else
-          Py_ssize_t slen = PyBytes_GET_SIZE(strtmp);
+          nbytes = PyBytes_GET_SIZE(strtmp);
 #endif
-          cbOutQuery += (slen * 2) + 16;
+          cbOutQuery += (nbytes * 2) + 16;
           Py_DECREF(strtmp);
         }
       }

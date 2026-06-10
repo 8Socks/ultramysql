@@ -94,6 +94,41 @@ Authoring it surfaced and fixed three real defects:
   `EscapeQueryArguments`, so a >64-char rendering (huge int / high-precision
   `Decimal`) overflowed the buffer. The estimate is now sized from the value.
 
+## Security review
+
+A multi-agent security review (escaping, buffer safety, untrusted-packet parsing,
+integer overflow, refcounts, auth) found and **fixed** the following. Several are
+pre-existing upstream bugs but all are in scope and now patched:
+
+**Param-controlled (app-reachable):**
+- **Escape output-buffer overflow** -- `AppendAndEscapeString` wrote without
+  checking its `buffEnd`, and the non-string size estimate counted code points
+  while the write encodes UTF-8 bytes (and called `PyObject_Str` twice, a TOCTOU
+  on a side-effecting `__str__`). Now: the writer is hard-bounded (returns -1 ->
+  query fails rather than overflowing), and the estimate is sized from the
+  encoded byte length. (Regression tests added.)
+- **NULL-deref** when a param's `__str__` raises (`PyObject_Str` -> NULL used
+  unchecked). Now checked.
+
+**Malicious / MITM server (parses untrusted wire data):**
+- **DATETIME/TIMESTAMP stack buffer overflow** -- `memcpy(temp /*char[20]*/,
+  value, cbValue)` with a server-controlled length up to 16MB. The copy was never
+  even read; removed it and added a length guard. (DATE got the same guard.)
+- **Result field-count OOB write** -- the field loop was unbounded and mixed two
+  different column counts, so a server sending more field packets than advertised
+  wrote past the `alloca`'d type array and the Python tuple. Now: one authoritative
+  count, capped to MySQL's 4096-column max, with the loop bounded.
+- **`readLengthCodedBinary` over-read** -- it advanced by a server-controlled
+  length guarded only by `assert()` (compiled out under `NDEBUG` in release
+  builds), so a returned (pointer,length) could reference memory past the packet.
+  Now: real runtime bounds checks + payload clamped to the packet.
+
+Verified after fixes: byte-identical to the original on py2, 75/75 compat, full
+edge suite green on both interpreters. Remaining lower-severity hardening (NULL
+checks on `PyObject_Malloc`/`PyObject_New`, handshake fixed-offset reads, the
+broader assert-only bounds in `PacketReader` read primitives, `scramble()`
+over-read) is noted for follow-up.
+
 ## Known limitations / follow-ups
 
 - Tested against `mysql_native_password` on MySQL 8. `caching_sha2_password`

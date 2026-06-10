@@ -600,9 +600,19 @@ void *Connection::handleResultPacket(int _fieldCount)
   UINT64 fieldCount = m_reader.readLengthCodedInteger();
   m_reader.skip();
 
+  (void) _fieldCount;
+
+  // Untrusted: the field count comes straight off the wire. MySQL allows at most
+  // 4096 columns; reject anything outside [1, 4096] so the alloca below cannot be
+  // driven to stack-exhaustion and the per-field array/tuple writes stay bounded.
+  if (fieldCount < 1 || fieldCount > 4096)
+  {
+    return NULL;
+  }
+
   int iField = 0;
 
-  void *resultSet = m_capi.createResult(_fieldCount);
+  void *resultSet = m_capi.createResult((int) fieldCount);
 
   // Read Field packets
 
@@ -653,6 +663,14 @@ void *Connection::handleResultPacket(int _fieldCount)
 
     //UINT8 *def = m_reader.readLengthCodedBinary(&cb_default);
 
+    // Untrusted: the server decides how many field packets precede the 0xfe EOF.
+    // Never write past the fieldCount-sized typeInfo[] array or the fields tuple.
+    if (iTypeInfo >= (int) fieldCount)
+    {
+      m_capi.destroyResult(resultSet);
+      return NULL;
+    }
+
     typeInfo[iTypeInfo].type = type;
     typeInfo[iTypeInfo].flags = flags;
     typeInfo[iTypeInfo].charset = charset;
@@ -662,6 +680,14 @@ void *Connection::handleResultPacket(int _fieldCount)
     iField ++;
     m_reader.skip();
 
+  }
+
+  // Untrusted: require exactly fieldCount field packets, so every typeInfo[index]
+  // read in the row loop below is initialized.
+  if (iTypeInfo != (int) fieldCount)
+  {
+    m_capi.destroyResult(resultSet);
+    return NULL;
   }
 
   // Read row data
@@ -692,7 +718,7 @@ void *Connection::handleResultPacket(int _fieldCount)
 
     m_capi.resultRowBegin(resultSet);
 
-    for (int index = 0; index < _fieldCount; index ++)
+    for (int index = 0; index < (int) fieldCount; index ++)
     {
       UINT8 *columnValue = m_reader.readLengthCodedBinary(&cb_column);
       if (!m_capi.resultRowValue (resultSet, index, &typeInfo[index], columnValue, cb_column))
