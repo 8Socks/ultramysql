@@ -98,15 +98,15 @@ module1 = Extension('umysql',
                 libraries=libs,
                 define_macros=[('WIN32_LEAN_AND_MEAN', None)])
 					
-setup (name = 'umysql',
+setup (name = 'umysql-2018',
        version = "3.0.0",
-       description = "Ultra fast MySQL driver for Python (Python 3 port)",
+       description = "Ultra fast MySQL driver for Python 2 and 3 (umysql-2018, Python 3 port)",
        ext_modules = [module1],
        author="Jonas Tarnstrom",
        author_email="jonas.tarnstrom@esn.me",
-       download_url="http://github.com/esnme/ultramysql",
+       url="https://github.com/8Socks/ultramysql",
+       download_url="https://github.com/8Socks/ultramysql",
        license="BSD License",
-       platforms=['any'],	   
-	   url="http://www.esn.me",
+       platforms=['any'],
        classifiers=CLASSIFIERS,
-	   )       
+       )
