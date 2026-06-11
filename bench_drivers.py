@@ -1,6 +1,6 @@
 # Driver benchmark harness: umysql (old/new) vs PyMySQL on py2/py3.
-# Untracked scratch tool (like probe_boundaries.py). Run cells SEQUENTIALLY on an
-# otherwise-idle box -- concurrent load corrupts the timings.
+# Reproduces the numbers in PORTING_PY3.md's Performance section. Run cells
+# SEQUENTIALLY on an otherwise-idle box -- concurrent load corrupts the timings.
 #
 # Usage:
 #   python bench_drivers.py <driver> <label> <mode>

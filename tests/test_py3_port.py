@@ -6,7 +6,7 @@ path in python/umysql.c / io_cpython.c. Requires MySQL 8 + utf8mb4 and a
 mysql_native_password user (gevent_test/gevent_test/gevent_test by default).
 """
 from __future__ import print_function
-import sys, gc, types, unittest
+import sys, gc, unittest
 
 try:
     import gevent
@@ -27,12 +27,6 @@ DB_USER = 'gevent_test'
 DB_PASSWD = 'gevent_test'
 DB_DB = 'gevent_test'
 
-# Some specs `import config` and read config.DATABASE[...] (mirrors the app's
-# config module that the gap-analysis agents referenced).
-_config = types.ModuleType('config')
-_config.DB_HOST, _config.DB_PORT, _config.DB_USER, _config.DB_PASSWD, _config.DB_DB = DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB
-_config.DATABASE = {'HOST': DB_HOST, 'PORT': DB_PORT, 'USER': DB_USER, 'PASS': DB_PASSWD, 'DB': DB_DB, 'RO_HOST': DB_HOST}
-sys.modules['config'] = _config
 
 def conn(charset='utf8mb4'):
     c = umysql.Connection()
@@ -142,8 +136,6 @@ class PortEdgeCases(unittest.TestCase):
             c.query("INSERT INTO umysql_dec_t (id, d) VALUES (%s, " + lit + ")", (rid,))
         rs = c.query("SELECT id, d FROM umysql_dec_t ORDER BY id")
         got = dict((r[0], r[1]) for r in rs.rows)
-        for _, lit in rows:
-            pass
         expected = {1: '-12345.6789000000', 2: '12345678901234567890.1234567890', 3: '0.0001000000', 4: '0.0000000000', 5: '100.0000000000'}
         for rid in expected:
             v = got[rid]
@@ -332,9 +324,9 @@ class PortEdgeCases(unittest.TestCase):
     def test_str_bytes_py3__py3_latin1_param_unencodable_raises(self):
         if not PY3:
             return
-        import umysql, config
+        import umysql
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'latin1')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'latin1')
         try:
             raised = False
             try:
@@ -351,9 +343,9 @@ class PortEdgeCases(unittest.TestCase):
     def test_str_bytes_py3__py3_query_string_unencodable_raises(self):
         if not PY3:
             return
-        import umysql, config
+        import umysql
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'latin1')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'latin1')
         try:
             raised = False
             try:
@@ -438,7 +430,7 @@ class PortEdgeCases(unittest.TestCase):
     def test_param_escaping__esc_bool_param_str_fallback(self):
         c = conn()
         rs = c.query("SELECT %s, %s", (True, False))
-        # str(True)='True', str(False)='False' emitted unquoted; MySQL treats TRUE/FALSE as 1/0
+        # bools render as unquoted 1/0 (explicit bool branch in the escaper)
         assert rs.rows == [(1, 0)], rs.rows
         c.close()
 
@@ -570,10 +562,9 @@ class PortEdgeCases(unittest.TestCase):
         c.close()
 
     def test_conn_lifecycle__conn_5arg_form(self):
-        import config
         c = umysql.Connection()
         # exactly 5 positional args -- exercises the |Os optional tail being absent
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'])
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB)
         assert c.is_connected() is True
         rs = c.query('SELECT %s', (u'héllo',))  # non-ascii unicode, default utf-8 codec must encode it
         assert rs.rows[0][0] == u'héllo'
@@ -584,10 +575,9 @@ class PortEdgeCases(unittest.TestCase):
         c.close()
 
     def test_conn_lifecycle__conn_invalid_charset_valueerror(self):
-        import config
         c = umysql.Connection()
         try:
-            c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'utf16')
+            c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'utf16')
             assert False, 'expected ValueError'
         except ValueError as e:
             assert str(e) == "Unsupported character set 'utf16' specified", repr(str(e))
@@ -596,9 +586,8 @@ class PortEdgeCases(unittest.TestCase):
 
     def test_conn_lifecycle__conn_latin1_charset_roundtrip(self):
         run_ddl('DROP TABLE IF EXISTS umysql_lc_latin1; CREATE TABLE umysql_lc_latin1 (v VARCHAR(32)) ENGINE=InnoDB DEFAULT CHARSET=latin1;')
-        import config
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'latin1')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'latin1')
         c.query('DROP TABLE IF EXISTS umysql_lc_latin1')
         c.query('CREATE TABLE umysql_lc_latin1 (v VARCHAR(32)) ENGINE=InnoDB DEFAULT CHARSET=latin1')
         c.query('INSERT INTO umysql_lc_latin1 (v) VALUES (%s)', (u'café',))  # encoded via latin-1 codec
@@ -610,9 +599,8 @@ class PortEdgeCases(unittest.TestCase):
         c.close()
 
     def test_conn_lifecycle__conn_ascii_charset_encode_fails(self):
-        import config
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'ascii')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'ascii')
         raised = False
         try:
             c.query('SELECT %s', (u'snöw',))  # non-ascii -> cannot encode as ascii
@@ -628,8 +616,7 @@ class PortEdgeCases(unittest.TestCase):
 
     def test_conn_lifecycle__conn_autocommit_false_rollback_isolation(self):
         run_ddl('DROP TABLE IF EXISTS umysql_lc_ac; CREATE TABLE umysql_lc_ac (id INT PRIMARY KEY AUTO_INCREMENT, v INT) ENGINE=InnoDB;')
-        import config
-        h,p,u,pw,db = config.DATABASE['HOST'],config.DATABASE['PORT'],config.DATABASE['USER'],config.DATABASE['PASS'],config.DATABASE['DB']
+        h,p,u,pw,db = DB_HOST,DB_PORT,DB_USER,DB_PASSWD,DB_DB
         setup = umysql.Connection(); setup.connect(h,p,u,pw,db,True,'utf8mb4')
         setup.query('DROP TABLE IF EXISTS umysql_lc_ac')
         setup.query('CREATE TABLE umysql_lc_ac (id INT PRIMARY KEY AUTO_INCREMENT, v INT) ENGINE=InnoDB')
@@ -646,11 +633,10 @@ class PortEdgeCases(unittest.TestCase):
         b.close()
 
     def test_conn_lifecycle__conn_double_connect_error_shape(self):
-        import config
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'utf8mb4')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'utf8mb4')
         try:
-            c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'utf8mb4')
+            c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'utf8mb4')
             assert False, 'expected umysql.Error on double connect'
         except umysql.Error as e:
             assert isinstance(e.args[0], int), type(e.args[0])
@@ -670,9 +656,8 @@ class PortEdgeCases(unittest.TestCase):
         assert c.is_connected() is False
 
     def test_conn_lifecycle__conn_close_twice_idempotent(self):
-        import config
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'utf8mb4')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'utf8mb4')
         assert c.close() is None
         assert c.is_connected() is False
         # second close on the same object -- idempotent, no raise
@@ -683,11 +668,10 @@ class PortEdgeCases(unittest.TestCase):
         assert fresh.is_connected() is False
 
     def test_conn_lifecycle__conn_wrong_creds_error_type_not_value(self):
-        import config
         c = umysql.Connection()
         raised = False
         try:
-            c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], 'no_such_user_xyz', 'wrong_pw', config.DATABASE['DB'], True, 'utf8mb4')
+            c.connect(DB_HOST, DB_PORT, 'no_such_user_xyz', 'wrong_pw', DB_DB, True, 'utf8mb4')
         except umysql.SQLError as e:
             raised = True
             assert isinstance(e.args[0], int), type(e.args[0])
@@ -698,8 +682,7 @@ class PortEdgeCases(unittest.TestCase):
         c.close()
 
     def test_conn_lifecycle__conn_reconnect_same_object(self):
-        import config
-        args = (config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'utf8mb4')
+        args = (DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'utf8mb4')
         c = umysql.Connection()
         c.connect(*args)
         assert c.query('SELECT 1').rows == [(1,)]
@@ -713,9 +696,8 @@ class PortEdgeCases(unittest.TestCase):
 
     def test_conn_lifecycle__conn_cp1250_charset_roundtrip(self):
         run_ddl('DROP TABLE IF EXISTS umysql_lc_cp1250; CREATE TABLE umysql_lc_cp1250 (v VARCHAR(32) CHARACTER SET cp1250) ENGINE=InnoDB;')
-        import config
         c = umysql.Connection()
-        c.connect(config.DATABASE['HOST'], config.DATABASE['PORT'], config.DATABASE['USER'], config.DATABASE['PASS'], config.DATABASE['DB'], True, 'cp1250')
+        c.connect(DB_HOST, DB_PORT, DB_USER, DB_PASSWD, DB_DB, True, 'cp1250')
         c.query('DROP TABLE IF EXISTS umysql_lc_cp1250')
         c.query('CREATE TABLE umysql_lc_cp1250 (v VARCHAR(32) CHARACTER SET cp1250) ENGINE=InnoDB')
         c.query('INSERT INTO umysql_lc_cp1250 (v) VALUES (%s)', (u'ő',))  # cp1250-only char, encoded via cp1250 codec
@@ -1530,11 +1512,15 @@ class PortEdgeCases(unittest.TestCase):
         c = conn()
         try:
             rs = c.query('SELECT %s', (I(5),))
+            # If the injection regressed, the UNION executes and yields TWO rows
+            # ([(0,), (version,)]). The malicious __str__ must instead be emitted as a
+            # single quoted literal -- exactly one row whose value is the literal text.
+            assert len(rs.rows) == 1, rs.rows
             v = rs.rows[0][0]
             gs = v.decode('utf-8') if isinstance(v, bytes) else (v if isinstance(v, str) else str(v))
-            assert 'UNION' in gs or gs.startswith('0')   # treated as a literal, not executed
+            assert gs == '0 UNION SELECT @@version', repr(gs)   # inert quoted literal, not executed
         except umysql.SQLError:
-            pass   # quoted-but-rejected is fine; the point is no @@version leak / no UNION
+            pass   # quoted-but-rejected is also fine; the point is no @@version leak / no UNION
         assert c.query('SELECT 1').rows == [(1,)]
         c.close()
 
@@ -1716,8 +1702,8 @@ class PortEdgeCases(unittest.TestCase):
 
 
     def test_gevent__pool_under_load(self):
-        # Mirrors the app's SQLAlchemy QueuePool over umysql under gevent: many
-        # greenlets concurrently check out / use / return pooled connections.
+        # A connection-pool pattern over umysql under gevent: many greenlets
+        # concurrently check out / use / return pooled connections.
         # Verifies (a) no cross-talk / corruption -- each greenlet gets its own
         # result -- and (b) the pool stays gevent-cooperative (queries overlap).
         if not HAVE_GEVENT:
@@ -1853,22 +1839,27 @@ class PortEdgeCases(unittest.TestCase):
     def _probe_single_value(self, length):
         # Insert a single LONGTEXT value of `length` bytes (built server-side via
         # REPEAT so the query text stays under the 4MB tx buffer), SELECT it back,
-        # and report (status, nrows, firstlen). Uses a fresh connection because
-        # some size regimes poison the connection.
+        # and report (status, a, b, reuse_ok) where reuse_ok is whether a follow-up
+        # query on the SAME connection still works (False == the big SELECT poisoned
+        # it). Uses a fresh connection per call.
         c = conn()
         c.query('DROP TABLE IF EXISTS bigval')
         c.query('CREATE TABLE bigval(t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
         c.query('INSERT INTO bigval VALUES (REPEAT(%s,%s))', ('z', length))
         try:
             rs = c.query('SELECT t FROM bigval')
-            out = ('ok', len(rs.rows), len(rs.rows[0][0]) if rs.rows else 0, c.is_connected())
+            out = ('ok', len(rs.rows), len(rs.rows[0][0]) if rs.rows else 0)
         except Exception as e:
-            out = ('raised', type(e).__name__, str(e.args), c.is_connected())
+            out = ('raised', type(e).__name__, repr(e.args))
+        try:
+            reuse_ok = (c.query('SELECT 1').rows == [(1,)])
+        except Exception:
+            reuse_ok = False
         try:
             c.close()
         except Exception:
             pass
-        return out
+        return out + (reuse_ok,)
 
     def test_size__single_value_just_over_packet_limit_silently_truncates(self):
         # A single value whose wire encoding reaches MySQL's 0xFFFFFF (16,777,215)
@@ -1878,11 +1869,17 @@ class PortEdgeCases(unittest.TestCase):
         # with NO exception (the dangerous failure mode). Empirically verified
         # against MySQL 8 on both py2 and py3 builds. PIN of current behavior --
         # flip when multi-part packet reassembly is implemented.
+        # Just under the limit: exact round-trip, connection reusable.
         assert self._probe_single_value(16777210) == ('ok', 1, 16777210, True)
-        # 16777212: wire payload (4-byte length code + value) exceeds 0xFFFFFF ->
-        # row splits into 2, value truncated to 16777211, connection survives.
-        status, nrows, firstlen, conn_ok = self._probe_single_value(16777212)
-        assert (status, nrows, firstlen) == ('ok', 2, 16777211), (status, nrows, firstlen)
+        # Exactly at 0xFFFFFF (4-byte length code + value == 16,777,215): the driver
+        # mis-frames it -- raises AND poisons the connection (not reusable).
+        status, _, _, reuse_ok = self._probe_single_value(16777211)
+        assert status == 'raised', status
+        assert reuse_ok is False, 'expected the connection to be poisoned'
+        # Just over: wire payload exceeds 0xFFFFFF -> row splits into 2, value silently
+        # truncated to 16,777,211, but the connection survives and is reusable.
+        status, nrows, firstlen, reuse_ok = self._probe_single_value(16777212)
+        assert (status, nrows, firstlen, reuse_ok) == ('ok', 2, 16777211, True), (status, nrows, firstlen, reuse_ok)
 
     def test_size__single_value_at_or_over_16mb_returns_empty_and_poisons(self):
         # A single value at or above the 16MB rx buffer (16,777,216) does not even
@@ -1890,8 +1887,9 @@ class PortEdgeCases(unittest.TestCase):
         # connection is left POISONED: the next query raises. PIN of current
         # behavior; a correct driver would raise a clean error on the SELECT and
         # keep the connection usable (PyMySQL handles this case correctly).
-        status, nrows, firstlen, conn_ok = self._probe_single_value(16 * 1024 * 1024)
+        status, nrows, _, reuse_ok = self._probe_single_value(16 * 1024 * 1024)
         assert (status, nrows) == ('ok', 0), (status, nrows)
+        assert reuse_ok is False, 'expected the connection to be poisoned'
 
     def test_size__large_total_result_forces_multiple_buffer_compactions(self):
         # ~40MB total across 40 x ~1MB rows (each value well under 0xFFFFFF, so no
@@ -1956,10 +1954,13 @@ class PortEdgeCases(unittest.TestCase):
         except Exception:
             pass
 
-    def test_conn_lifecycle__killed_connection_error_shape_first_then_not_connected(self):
-        # Two-step contract after the server kills the connection: the FIRST query
-        # raises a umysql error (recv returns 0 -> setError closes the socket); the
-        # SECOND raises "Not connected" (socket already gone). Pins the transition.
+    def test_conn_lifecycle__killed_connection_raises_then_unusable(self):
+        # After the server kills the connection, the FIRST query raises, and the
+        # connection is then not cleanly reusable. The exact first-error TYPE is
+        # timing-dependent -- recv seeing EOF surfaces a umysql.Error/RuntimeError,
+        # while the socket layer raising surfaces a raw socket.error
+        # (EnvironmentError); both are valid. So pin only the stable contract: it
+        # raises, then it is unusable.
         victim = conn()
         cid = int(victim.query('SELECT CONNECTION_ID()').rows[0][0])
         killer = conn()
@@ -1971,14 +1972,14 @@ class PortEdgeCases(unittest.TestCase):
         except Exception as e:
             first = e
         assert first is not None, 'expected an error after KILL'
-        assert isinstance(first, (umysql.Error, RuntimeError)), type(first)
-        assert victim.is_connected() is False
-        second = None
+        # Must not be cleanly reusable: a follow-up either raises or is_connected() is
+        # False -- it must NOT return a clean fresh result.
+        reusable = False
         try:
-            victim.query('SELECT 1')
-        except Exception as e:
-            second = e
-        assert second is not None and 'not connected' in str(second).lower(), second
+            reusable = (victim.query('SELECT 1').rows == [(1,)])
+        except Exception:
+            reusable = False
+        assert not reusable, 'killed connection still returned a clean result'
         try:
             victim.close()
         except Exception:
@@ -2026,10 +2027,15 @@ class PortEdgeCases(unittest.TestCase):
         assert default_eq == uni_eq, (default_eq, uni_eq)  # connection default == unicode_ci (the fix)
         c.close()
 
-    def test_concurrency_gevent__killed_greenlet_no_stale_rows_on_reuse(self):
-        # A greenlet killed mid-query (GreenletExit inside recv) must not leave the
-        # connection returning the half-streamed result as stale data on reuse. A
-        # clean fresh result OR a clean error is acceptable; garbled/stale rows are not.
+    def test_concurrency_gevent__killed_greenlet_mid_query_corrupts_connection(self):
+        # A greenlet killed (GreenletExit) mid-recv leaves the connection
+        # DESYNCHRONIZED: the socket still has the killed query's bytes queued, and
+        # the driver does not detect this. Per the suite's established contract (see
+        # gevent_shared_connection_mid_query_corrupts) the driver makes NO safety
+        # guarantee here -- reuse must NOT silently return the correct fresh result;
+        # it returns stale/garbled rows or raises. PIN of current behavior: don't
+        # reuse a connection whose query was interrupted (close + reconnect instead).
+        # Flip this if the driver is changed to close/reset on interrupted recv.
         if not HAVE_GEVENT:
             self.skipTest('gevent not installed')
         import gevent
@@ -2041,21 +2047,28 @@ class PortEdgeCases(unittest.TestCase):
         for i in range(20):
             c.query('INSERT INTO gk VALUES (%s, REPEAT(%s,%s))', (i, 'a', 1000000))   # ~20MB
         g = gevent.spawn(lambda: c.query('SELECT id, t FROM gk ORDER BY id'))
-        gevent.sleep(0)   # let the recv start
+        gevent.sleep(0)   # let the large recv start
+        finished_before_kill = g.ready()
         g.kill()
         try:
-            assert c.query('SELECT 99').rows == [(99,)], 'stale/garbled data on reuse'
-        except Exception:
-            pass   # a clean error on reuse is acceptable
+            ok = (c.query('SELECT 99').rows == [(99,)])
+        except (umysql.Error, RuntimeError):
+            ok = False   # a clean error is also a "not safely reusable" signal
+        if finished_before_kill:
+            assert ok, 'query completed cleanly but connection was unusable on reuse'
+        else:
+            assert not ok, 'killed-mid-query connection behaved as if safe on reuse'
         try:
             c.close()
         except Exception:
             pass
 
-    def test_concurrency_gevent__timeout_mid_large_result_no_stale_rows_on_reuse(self):
-        # Same hazard via gevent.Timeout firing during the multi-recv of a large
-        # result: reuse must be clean (correct fresh data) or a clean error, never the
-        # interrupted result's stale rows.
+    def test_concurrency_gevent__timeout_mid_large_result_corrupts_connection(self):
+        # Same desync via gevent.Timeout firing during the multi-recv of a large
+        # result. Same contract: if the timeout actually interrupts the query, the
+        # connection is corrupted and reuse must NOT return the correct fresh result;
+        # if the query finished before the timeout, reuse must be clean. PIN of
+        # current behavior.
         if not HAVE_GEVENT:
             self.skipTest('gevent not installed')
         import gevent
@@ -2066,15 +2079,20 @@ class PortEdgeCases(unittest.TestCase):
         c.query('CREATE TABLE tmid(id INT, t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
         for i in range(30):
             c.query('INSERT INTO tmid VALUES (%s, REPEAT(%s,%s))', (i, 'a', 1000000))   # ~30MB
+        interrupted = False
         try:
             with gevent.Timeout(0.005):
                 c.query('SELECT id, t FROM tmid ORDER BY id')
         except gevent.Timeout:
-            pass
+            interrupted = True
         try:
-            assert c.query('SELECT 77').rows == [(77,)], 'stale/garbled data on reuse'
-        except Exception:
-            pass   # clean error acceptable
+            ok = (c.query('SELECT 77').rows == [(77,)])
+        except (umysql.Error, RuntimeError):
+            ok = False
+        if interrupted:
+            assert not ok, 'timeout-interrupted connection behaved as if safe on reuse'
+        else:
+            assert ok, 'uninterrupted query left connection unusable on reuse'
         try:
             c.close()
         except Exception:

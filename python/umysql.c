@@ -148,7 +148,17 @@ void *API_createResult(int columns)
 void API_resultSetField(void *result, int column, UMTypeInfo *ti, void *_name, size_t _cbName)
 {
   PyObject *field = PyTuple_New(2);
-  PyTuple_SET_ITEM(field, 0, UM_NATIVE_STR_N((const char *)_name, _cbName));
+  PyObject *nameobj = UM_NATIVE_STR_N((const char *)_name, _cbName);
+  if (nameobj == NULL)
+  {
+    // On py3 UM_NATIVE_STR_N is a strict UTF-8 decode, which returns NULL and sets
+    // an exception for a non-UTF-8 column name (e.g. a latin1 connection, or odd
+    // alias bytes). Don't store NULL into the tuple or leak the exception across
+    // the C boundary -- fall back to the raw bytes so a name always exists.
+    PyErr_Clear();
+    nameobj = PyBytes_FromStringAndSize((const char *)_name, _cbName);
+  }
+  PyTuple_SET_ITEM(field, 0, nameobj);
   PyTuple_SET_ITEM(field, 1, PyInt_FromLong(ti->type));
   PyTuple_SET_ITEM(((ResultSet *) result)->fields, column, field);
   PRINTMARK();
@@ -1019,7 +1029,16 @@ static int UM_IsBareNumeric(const char *s, Py_ssize_t n)
   {
     char ch = s[i];
     if (ch >= '0' && ch <= '9') { hasDigit = 1; continue; }
-    if (ch == '+' || ch == '-' || ch == '.' || ch == 'e' || ch == 'E') continue;
+    if (ch == '+' || ch == '-')
+    {
+      // A sign is numeric only at the very start or right after an exponent marker.
+      // Anywhere else (e.g. "1--") it is not a number and must be quoted -- otherwise
+      // an unquoted "--" would inject a comment into the surrounding statement. Real
+      // int/float/Decimal output never has a sign in any other position.
+      if (i == 0 || s[i - 1] == 'e' || s[i - 1] == 'E') continue;
+      return 0;
+    }
+    if (ch == '.' || ch == 'e' || ch == 'E') continue;
     return 0;
   }
   return hasDigit;

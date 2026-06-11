@@ -611,7 +611,18 @@ void Connection::handleErrorPacket()
 
   UINT8 *message = m_reader.readBytes(len);
 
-  std::string errorMessage((char *) message, len);
+  // A truncated/malformed error packet can latch the reader's overflow guard so a
+  // read returns NULL while len stays positive (the failed read does not advance
+  // the cursor). std::string(NULL, len>0) is undefined behavior -- bail out with a
+  // generic message instead of dereferencing NULL. Reachable from the handshake
+  // path too, so a rogue server can otherwise crash the client on connect.
+  if (m_reader.overflowed() || (message == NULL && len > 0))
+  {
+    setError ("Malformed error packet from server", (int) errnum, UME_MYSQL);
+    return;
+  }
+
+  std::string errorMessage((char *) message, message ? len : 0);
   setError (errorMessage.c_str (), (int) errnum, UME_MYSQL);
 }
 

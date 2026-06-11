@@ -64,16 +64,14 @@ carries `(int code, str message)`; a closed connection raises
 `RuntimeError('Not connected')`. The same source also builds and smoke-tests on
 Python 2.7 (no behavior change).
 
-### Performance (single-threaded, vs the alternatives)
+### Performance
 
-| driver | point SELECT | large fetch (5k rows) | insert |
-|--------|-------------:|----------------------:|-------:|
-| umysql py2 (C) | 0.055 ms | 1.3 ms | 0.33 ms |
-| **umysql py3 (this port)** | **0.055 ms** | **1.1 ms** | **0.22 ms** |
-| PyMySQL (pure Python) | 0.110 ms | 25.9 ms | 0.24 ms |
-
-The port keeps full C speed -- ~24x faster than PyMySQL on large result-set
-decoding, the case where pure-Python drivers hurt most.
+Benchmarked rigorously vs the production 2.63.7 build and PyMySQL across py2/py3
+and several workloads -- see the **"Performance (benchmarked vs production 2.63.7
+and PyMySQL)"** section below for the full tables and methodology. Summary: this
+port matches the production C build within noise, the py3 build is faster still,
+and umysql is ~6-14x faster than PyMySQL on read-heavy workloads (more on CPU,
+which drives a ~19x gevent throughput gap).
 
 ### gevent cooperation
 
@@ -83,11 +81,12 @@ measured cooperative on py2 (10 concurrent `SELECT SLEEP(0.5)` complete in
 
 ## Edge-case test suite (`tests/test_py3_port.py`)
 
-A 79-test suite covering type decoding (every MySQL type incl. JSON/BIT/SET/
+A 114-test suite covering type decoding (every MySQL type incl. JSON/BIT/SET/
 unsigned boundaries), py3 str/bytes boundaries, param escaping + SQL-injection,
-connection/charset/auth lifecycle, ResultSet/protocol edges, gevent concurrency,
-and refcount/leak behavior on the rewritten paths. Runs green on both py2.7
-(gevent active -> the 7 concurrency tests execute) and py3.9 (those 7 skip).
+connection/charset/auth lifecycle, ResultSet/protocol edges, capacity/packet-size
+boundaries, charset/collation interop, gevent concurrency, and refcount/leak
+behavior on the rewritten paths. Runs green on both py2.7 (gevent active -> the 10
+gevent-gated tests execute) and py3.9 (those 10 skip).
 
 Authoring it surfaced and fixed three real defects:
 - **BIT/GEOMETRY decoded as text** -> on py3 a non-ASCII byte (e.g. `BIT(8)=0xFF`)
@@ -166,10 +165,22 @@ tests added.
   FLOAT decode now NULL-check their allocations.
 
 After all three passes: byte-identical to the original on py2, 75/75 compat, the
-the edge suite green on py2.7 and py3.9, and the upstream suite's
-connect/auth/type tests pass (a successful handshake exercises the hardened
-path). No known remaining memory-safety issues from either the param or the
-server surface.
+edge suite green on py2.7 and py3.9, and the upstream suite's connect/auth/type
+tests pass (a successful handshake exercises the hardened path).
+
+A later cross-model review (a different model than wrote the port) found two more
+issues the original passes missed, both now fixed:
+- **`handleErrorPacket` NULL deref** -- the hardening made `readBytes()` return
+  NULL on a short read, but this site (unlike the result path) did not check
+  `overflowed()`, so a truncated/malformed error packet ran `std::string(NULL,
+  len>0)` (UB). Reachable on the handshake path, so a rogue server could crash the
+  client on connect. Now bails to a generic message on overflow/NULL.
+- **Field-name strict-UTF-8 NULL** -- on py3 a non-UTF-8 column name (e.g. a
+  latin1 connection) made the strict decode return NULL + set an exception, which
+  was stored into the fields tuple and leaked across the C boundary. Now falls back
+  to raw `bytes`.
+Also tightened the bare-numeric param classifier to quote a mid-string `-` (the
+`--` comment edge) -- only a sign at the start or after an exponent is numeric.
 
 ## Performance (benchmarked vs production 2.63.7 and PyMySQL 0.10.1)
 
@@ -230,6 +241,14 @@ survived, final query healthy. No leaks, no drift, no anomalies.
   truncates to 16,777,211 bytes and splits the row in two (no exception); >=16MB
   returns an empty result set and poisons the connection. Don't store single
   column values >=16MB through this driver until reassembly is implemented.
+- **A query interrupted mid-recv corrupts the connection.** If a gevent
+  `Timeout`/`kill` (or any exception) fires while a result is being received, the
+  socket is left desynchronized (the server's remaining bytes are still queued) and
+  the driver does not detect it -- reusing that connection returns stale/garbled
+  rows or raises. Discard and reconnect after any interrupted query; do not share a
+  connection across concurrent greenlets mid-query. Pre-existing (shared C core);
+  pinned by `test_concurrency_gevent__*_corrupts_connection`. A proper fix would
+  close/reset the connection on interrupted recv.
 - A `>65`-digit numeric literal sent to MySQL 8 hangs on py2 (the recv path);
   this reproduces on the *original* umysql too (pre-existing, not a port issue).
 - py3+gevent concurrency benchmark still to be run in a gevent-enabled env (the
@@ -242,10 +261,10 @@ umysql does too -- `scramble()` is the native-password SHA1 algorithm and the
 handshake parser does not read the server's auth-plugin name. There is no support
 for `caching_sha2_password` (MySQL 8's default plugin for newly-created users).
 
-**You almost certainly do not need it for the Python 3 migration.** If the app
-authenticates against prod MySQL 8 today on the current umysql, those users are
-already configured with `mysql_native_password` (otherwise the current driver
-could not connect), and this port preserves that exactly. Confirm with:
+**You almost certainly do not need it to adopt this port.** Any user that the
+original umysql can already authenticate against MySQL 8 is configured with
+`mysql_native_password` (otherwise the original driver could not connect), and
+this port preserves that behavior exactly. Confirm with:
 
 ```sql
 SELECT user, plugin FROM mysql.user;
@@ -277,13 +296,14 @@ that server upgrade, NOT for the py3 cutover.
 ### Recommended approach when it is actually needed
 
 Do **not** add an OpenSSL C link or write RSA in C. The driver already routes its
-I/O through a Python socket object, and the application already depends on
-`cryptography`/`pycryptodome`. So:
+I/O through a Python socket object, so RSA can be delegated to Python if a crypto
+library is available. So:
 
 - Implement **SHA-256 + the fast path + the auth state machine in C** (tier 1).
 - For the `0x04` full-auth RSA step, **call a small Python helper** (via the
-  C-API) that fetches the public key and does RSA-OAEP with `cryptography` -- a
-  few lines, well-tested, no new native dependency, CPU-only (gevent-safe).
+  C-API) that fetches the public key and does RSA-OAEP with `cryptography` (or
+  `pycryptodome`) -- a few lines, well-tested, no new native dependency, CPU-only
+  (gevent-safe).
 
 Rough estimate: fast-path only ~1-2 days; complete with the RSA step delegated to
 Python ~3-5 days; fully self-contained C (hand-rolled RSA) ~2 weeks plus
