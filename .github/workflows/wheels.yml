@@ -37,41 +37,44 @@ jobs:
           path: ./wheelhouse/*.whl
 
   build_py2:
-    name: py2.7 wheels (${{ matrix.arch }})
+    name: py2.7 wheel (x86_64)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up QEMU (cross-arch)
-        if: matrix.arch == 'aarch64'
-        uses: docker/setup-qemu-action@v3
-      - name: Build cp27 wheels in manylinux2014 (direct, cibuildwheel 1.x is too bitrotten)
+      - name: Build cp27 x86_64 wheel (a frozen manylinux that still ships py2.7)
         run: |
           mkdir -p wheelhouse
-          IMG=quay.io/pypa/manylinux2014_${{ matrix.arch }}:2021-05-01-28d233a
-          docker run --rm -v "$PWD":/io -w /io "$IMG" bash -c '
-            set -e
-            echo "=== /opt/python in this image ==="; ls -1 /opt/python || true
-            mkdir -p /tmp/w; found=0
-            for PYBIN in /opt/python/cp27-*/bin; do
-              [ -x "$PYBIN/pip" ] || continue
-              found=1; echo "=== building with $PYBIN ==="
-              "$PYBIN/pip" install -q wheel setuptools || true
-              "$PYBIN/pip" wheel /io --no-deps -w /tmp/w
-            done
-            if [ "$found" = 0 ]; then echo "NO cp27 python found in image"; exit 3; fi
-            for whl in /tmp/w/*.whl; do auditwheel repair "$whl" -w /io/wheelhouse; done
-            echo "=== built wheels ==="; ls -l /io/wheelhouse
-            FIRST=$(ls /io/wheelhouse/*.whl | head -1)
-            CP=$(ls /opt/python/cp27-*/bin/python | head -1)
-            "$CP" -m pip install "$FIRST" && "$CP" -c "import umysql; print(umysql.__version__)"
-          '
+          built=0
+          # manylinux2014/2010 *latest* dropped py2.7; the older frozen images still
+          # carry cp27. Try each and use the first that has it (x86_64 only -- no
+          # manylinux image ships py2.7 for aarch64).
+          for IMG in \
+            quay.io/pypa/manylinux2010_x86_64:latest \
+            quay.io/pypa/manylinux1_x86_64:latest ; do
+            echo "### trying $IMG"
+            docker pull -q "$IMG" || { echo "pull failed"; continue; }
+            HASCP27=$(docker run --rm "$IMG" bash -c 'ls -d /opt/python/cp27-* 2>/dev/null | head -1 || true')
+            echo "cp27 in image: ${HASCP27:-<none>}"
+            [ -n "$HASCP27" ] || continue
+            docker run --rm -v "$PWD":/io -w /io "$IMG" bash -c '
+              set -e
+              mkdir -p /tmp/w
+              for PYBIN in /opt/python/cp27-*/bin; do
+                echo "=== building with $PYBIN ==="
+                "$PYBIN/pip" wheel /io --no-deps -w /tmp/w
+              done
+              for whl in /tmp/w/*.whl; do auditwheel repair "$whl" -w /io/wheelhouse; done
+              CP=$(ls /opt/python/cp27-*/bin/python | head -1)
+              "$CP" -m pip install /io/wheelhouse/*.whl
+              "$CP" -c "import umysql; print(umysql.__version__)"
+            '
+            built=1; break
+          done
+          [ "$built" = 1 ] || { echo "FAILED: no manylinux image with cp27 available"; exit 1; }
+          echo "=== cp27 wheels ==="; ls -l wheelhouse
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-cp27-${{ matrix.arch }}
+          name: wheels-cp27-x86_64
           path: ./wheelhouse/*.whl
 
   sdist:
