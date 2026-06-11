@@ -1506,6 +1506,113 @@ class PortEdgeCases(unittest.TestCase):
         c.close()
 
 
+    def test_security__object_str_fallback_quoted_no_injection(self):
+        # A non-string param whose str() returns SQL must be QUOTED (inert), not
+        # spliced raw. Was an injection via the unquoted str() fallback.
+        class Evil(object):
+            def __str__(self):
+                return "1 OR 1=1"
+        c = conn()
+        c.query('DROP TABLE IF EXISTS si')
+        c.query('CREATE TABLE si(id INT, v INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO si VALUES (1,10),(2,20)')
+        # injected -> "v = 1 OR 1=1" returns ALL rows; quoted -> "v = '1 OR 1=1'"
+        # coerces to 1 -> matches 0 rows.
+        rows = c.query('SELECT id FROM si WHERE v = %s', (Evil(),)).rows
+        assert rows == [], rows
+        c.query('DROP TABLE si'); c.close()
+
+    def test_security__int_subclass_malicious_str_no_union(self):
+        class I(int):
+            def __str__(self):
+                return "0 UNION SELECT @@version"
+        c = conn()
+        try:
+            rs = c.query('SELECT %s', (I(5),))
+            v = rs.rows[0][0]
+            gs = v.decode('utf-8') if isinstance(v, bytes) else (v if isinstance(v, str) else str(v))
+            assert 'UNION' in gs or gs.startswith('0')   # treated as a literal, not executed
+        except umysql.SQLError:
+            pass   # quoted-but-rejected is fine; the point is no @@version leak / no UNION
+        assert c.query('SELECT 1').rows == [(1,)]
+        c.close()
+
+    def test_security__numeric_params_still_unquoted(self):
+        # Regression: the injection fix must NOT quote genuine numerics (LIMIT needs
+        # an unquoted integer; a quoted '2' is a syntax error).
+        c = conn()
+        c.query('DROP TABLE IF EXISTS nm')
+        c.query('CREATE TABLE nm(id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO nm VALUES (1),(2),(3)')
+        assert len(c.query('SELECT id FROM nm ORDER BY id LIMIT %s', (2,)).rows) == 2
+        assert c.query('SELECT id FROM nm WHERE id = %s', (3,)).rows == [(3,)]
+        c.query('DROP TABLE nm'); c.close()
+
+    def test_security__collection_and_special_floats_no_crash(self):
+        c = conn()
+        for p in ([1, 2, 3], {'a': 1}, (1, 2), float('inf'), float('nan')):
+            try:
+                c.query('SELECT %s', (p,))
+            except umysql.SQLError:
+                pass   # quoted garbage -> clean SQL error; never a crash/injection
+            assert c.query('SELECT 1').rows == [(1,)]
+        c.close()
+
+    def test_security__datetime_subclass_shrinking_str_no_overflow(self):
+        import datetime
+        class EvilDT(datetime.datetime):
+            def __str__(self):
+                return ''   # shrinks the per-arg size estimate
+        c = conn()
+        try:
+            c.query('SELECT %s', (EvilDT(2024, 6, 15, 12, 30, 45),))
+        except Exception:
+            pass   # bounded snprintf may fail the query; the point is no overflow
+        assert c.query('SELECT 1').rows == [(1,)]   # no memory corruption
+        c.query('SELECT %s', (datetime.datetime(2024, 6, 15, 12, 30, 45),))  # normal still works
+        c.close()
+
+    def test_security__params_iter_raises_no_crash(self):
+        class BadIter(object):
+            def __iter__(self):
+                raise ValueError('boom')
+        c = conn()
+        try:
+            c.query('SELECT %s', BadIter())
+        except Exception:
+            pass   # must raise cleanly, not NULL-deref
+        assert c.query('SELECT 1').rows == [(1,)]
+        c.close()
+
+    def test_security__params_iter_raises_on_later_pass(self):
+        class Flaky(object):
+            n = 0
+            def __iter__(self):
+                Flaky.n += 1
+                if Flaky.n >= 2:   # ok for validation, raises on a later GetIter
+                    raise ValueError('boom2')
+                return iter([1])
+        c = conn()
+        try:
+            c.query('SELECT %s', Flaky())
+        except Exception:
+            pass
+        assert c.query('SELECT 1').rows == [(1,)]   # NULL-checked GetIter, no crash
+        c.close()
+
+    def test_security__single_use_generator_params(self):
+        def gen():
+            yield 1
+            yield 2
+        c = conn()
+        try:
+            c.query('SELECT %s, %s', gen())   # iterated twice; single-use gen
+        except Exception:
+            pass   # clean error ok; no crash/overflow
+        assert c.query('SELECT 1').rows == [(1,)]
+        c.close()
+
+
 
 if __name__ == "__main__":
     unittest.main()

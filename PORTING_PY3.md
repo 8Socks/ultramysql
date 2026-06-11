@@ -124,10 +124,34 @@ pre-existing upstream bugs but all are in scope and now patched:
   Now: real runtime bounds checks + payload clamped to the packet.
 
 Verified after fixes: byte-identical to the original on py2, 75/75 compat, full
-edge suite green on both interpreters. Remaining lower-severity hardening (NULL
-checks on `PyObject_Malloc`/`PyObject_New`, handshake fixed-offset reads, the
-broader assert-only bounds in `PacketReader` read primitives, `scramble()`
-over-read) is noted for follow-up.
+edge suite green on both interpreters.
+
+**Second pass -- hostile user input flowing into the library (param values/types,
+the params iterable, encoding).** This is the realistic app-level threat. Found
+and fixed three more:
+- **Injection via the unquoted str() fallback** -- any param that is not a real
+  str/bytes/None/datetime/bool (a custom object, an `int` subclass, a `list`/
+  `dict`, `float('inf')`) was rendered into the SQL UNQUOTED, so an object whose
+  `__str__` returns `1 OR 1=1` injected. Now the str() fallback is emitted
+  unquoted ONLY for a genuine numeric literal (digits/sign/dot/exponent); anything
+  else is quoted+escaped into an inert string literal. (bool keeps unquoted 1/0;
+  genuine int/float/Decimal stay unquoted so `LIMIT %s` etc. still work.)
+- **Heap overflow via the datetime sprintf** -- the datetime/date write used an
+  unbounded `sprintf` that bypassed the escaper's bound; a `datetime` subclass
+  with a shrinking `__str__` undersized the estimate (proven with ASAN). Now
+  bounds-checked before the write.
+- **NULL-deref crash** when a params object's `__iter__` raises (`PyObject_GetIter`
+  was unchecked on both the sizing and writing passes). Now checked.
+
+The escaping of genuine str/bytes params was confirmed sound across all byte
+values, control chars, and every selectable charset (no multibyte break-out --
+only single-byte and utf8 charsets are selectable). 8 user-input regression
+tests added.
+
+Remaining lower-severity hardening (NULL checks on `PyObject_Malloc`/`PyObject_New`,
+handshake fixed-offset reads, the broader assert-only bounds in `PacketReader`
+read primitives, `scramble()` over-read -- all malicious-SERVER only) is noted
+for follow-up.
 
 ## Known limitations / follow-ups
 

@@ -999,6 +999,27 @@ int AppendAndEscapeString(char *buffStart, char *buffEnd, const char *strStart, 
   return (int) (buffOffset - buffStart);
 }
 
+/* A str()-rendered fallback arg is emitted UNQUOTED only when it is a bare
+   numeric literal (digits, sign, decimal point, exponent). Those bytes cannot
+   contain a quote, space, or SQL keyword, so they cannot break out of the
+   expression. Anything else -- a custom __str__, a collection, inf/nan, an int
+   subclass returning SQL -- is quoted+escaped into an inert string literal,
+   preventing SQL injection via a non-string param object. */
+static int UM_IsBareNumeric(const char *s, Py_ssize_t n)
+{
+  Py_ssize_t i;
+  int hasDigit = 0;
+  if (n <= 0) return 0;
+  for (i = 0; i < n; i++)
+  {
+    char ch = s[i];
+    if (ch >= '0' && ch <= '9') { hasDigit = 1; continue; }
+    if (ch == '+' || ch == '-' || ch == '.' || ch == 'e' || ch == 'E') continue;
+    return 0;
+  }
+  return hasDigit;
+}
+
 int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
 {
   int ret;
@@ -1039,6 +1060,7 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
     else
       if (obj == Py_None)
       {
+        if (end - start < 4) return -1;
         (*start++) = 'n';
         (*start++) = 'u';
         (*start++) = 'l';
@@ -1046,9 +1068,25 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
         return  4;
       }
       else
+      if (obj == Py_True || obj == Py_False)
+      {
+        /* bool -> unquoted 1/0 (numeric). Without this, a bool would fall to the
+           str() fallback and be quoted as 'True'/'False' -- the right security
+           default for unknown objects, but wrong for a genuine boolean. */
+        if (end - start < 1) return -1;
+        (*start++) = (obj == Py_True) ? '1' : '0';
+        return 1;
+      }
+      else
         if (PyDateTime_Check(obj))
         {
-          int len = sprintf (start, "'%04d-%02d-%02d %02d:%02d:%02d'", 
+          /* Output is fixed-width "'YYYY-MM-DD HH:MM:SS'" = 21 bytes (year is
+             constrained to 1-9999 by Python). Verify the reserved space first so
+             a datetime subclass with a shrinking __str__ (which undersizes the
+             per-arg estimate) fails rather than overflowing. */
+          int len;
+          if (end - start < 24) return -1;
+          len = sprintf (start, "'%04d-%02d-%02d %02d:%02d:%02d'",
             PyDateTime_GET_YEAR(obj),
             PyDateTime_GET_MONTH(obj),
             PyDateTime_GET_DAY(obj),
@@ -1061,7 +1099,9 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
         else
           if (PyDate_Check(obj))
           {
-            int len = sprintf (start, "'%04d:%02d:%02d'", 
+            int len;
+            if (end - start < 16) return -1;   /* "'YYYY:MM:DD'" = 12 bytes */
+            len = sprintf (start, "'%04d:%02d:%02d'",
               PyDateTime_GET_YEAR(obj),
               PyDateTime_GET_MONTH(obj),
               PyDateTime_GET_DAY(obj));
@@ -1082,7 +1122,11 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
             if (strobj == NULL) return -1;
           }
 #endif
-          ret = AppendAndEscapeString(start, end, PyBytes_AS_STRING(strobj), PyBytes_AS_STRING(strobj) + PyBytes_GET_SIZE(strobj), FALSE);
+          /* Unquoted only for a genuine numeric literal; quote+escape everything
+             else so an attacker-influenced non-string param object (custom
+             __str__, int subclass, list/dict, inf/nan, ...) cannot inject SQL. */
+          ret = AppendAndEscapeString(start, end, PyBytes_AS_STRING(strobj), PyBytes_AS_STRING(strobj) + PyBytes_GET_SIZE(strobj),
+                                      UM_IsBareNumeric(PyBytes_AS_STRING(strobj), PyBytes_GET_SIZE(strobj)) ? FALSE : TRUE);
           Py_DECREF(strobj);
           return ret;
 }
@@ -1105,6 +1149,10 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
   cbOutQuery += PyBytes_GET_SIZE(inQuery);
 
   iterator = PyObject_GetIter(iterable);
+  if (iterator == NULL)
+  {
+    return NULL;   /* a params object whose __iter__ raises must not NULL-deref */
+  }
 
   while ( (arg = PyIter_Next(iterator)))
   {
@@ -1171,6 +1219,11 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
 
 
   iterator = PyObject_GetIter(iterable);
+  if (iterator == NULL)
+  {
+    if (heap) PyObject_Free(obuffer);
+    return NULL;   /* __iter__ that raises on the 2nd pass must not NULL-deref */
+  }
 
   while (1)
   {
