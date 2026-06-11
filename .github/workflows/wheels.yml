@@ -37,8 +37,16 @@ jobs:
           path: ./wheelhouse/*.whl
 
   build_py2:
-    name: py2.7 wheel (x86_64)
-    runs-on: ubuntu-22.04   # last Ubuntu LTS that still packages python2.7 in apt
+    name: py2.7 wheel (${{ matrix.label }})
+    # ubuntu-22.04 is the last LTS that packages python2.7 in apt; GitHub's native
+    # ARM64 runner builds the aarch64 wheel without QEMU or a manylinux image.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, label: x86_64 }
+          - { runner: ubuntu-22.04-arm, label: aarch64 }
     steps:
       - uses: actions/checkout@v4
       - name: Install Python 2.7 + build tools (per ffcpy copilot-setup recipe)
@@ -64,7 +72,7 @@ jobs:
           python2.7 -c "import umysql; print(umysql.__version__)"
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-cp27-x86_64
+          name: wheels-cp27-${{ matrix.label }}
           path: ./wheelhouse/*.whl
 
   sdist:
