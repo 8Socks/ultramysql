@@ -102,8 +102,12 @@ Connection::~Connection()
 void Connection::scramble(const char *_scramble1, const char *_scramble2, UINT8 _outToken[20])
 {
   std::string seed;
-  seed += _scramble1;
-  seed += _scramble2;
+  // _scramble1 is exactly 8 bytes and is NOT NUL-terminated -- append a fixed 8
+  // rather than `seed += ptr` (which would read past it to the next NUL).
+  // _scramble2 is NUL-terminated within the packet. Either may be NULL if the
+  // server sent a short/malformed handshake.
+  if (_scramble1 != NULL) seed.append(_scramble1, 8);
+  if (_scramble2 != NULL) seed += _scramble2;
 
   CSHA1 passdg;
   UINT8 stage1_hash[20];
@@ -279,6 +283,15 @@ bool Connection::processHandshake()
     else
     {
       setError("Authentication < 4.1 not supported", 2, UME_OTHER);
+      return false;
+    }
+
+    // Untrusted handshake: bail out if any read ran past the packet (overflow
+    // latched) or a required field was malformed (NULL) before the data feeds
+    // scramble() / the auth response.
+    if (m_reader.overflowed() || serverVersion == NULL || scrambleBuff == NULL || scrambleBuff2 == NULL)
+    {
+      setError("Malformed handshake packet from server", 0, UME_OTHER);
       return false;
     }
 
@@ -613,6 +626,10 @@ void *Connection::handleResultPacket(int _fieldCount)
   int iField = 0;
 
   void *resultSet = m_capi.createResult((int) fieldCount);
+  if (resultSet == NULL)
+  {
+    return NULL;
+  }
 
   // Read Field packets
 
@@ -682,9 +699,9 @@ void *Connection::handleResultPacket(int _fieldCount)
 
   }
 
-  // Untrusted: require exactly fieldCount field packets, so every typeInfo[index]
-  // read in the row loop below is initialized.
-  if (iTypeInfo != (int) fieldCount)
+  // Untrusted: require exactly fieldCount field packets (so every typeInfo[index]
+  // read in the row loop is initialized) and that no field read ran off a packet.
+  if (iTypeInfo != (int) fieldCount || m_reader.overflowed())
   {
     m_capi.destroyResult(resultSet);
     return NULL;
@@ -726,6 +743,13 @@ void *Connection::handleResultPacket(int _fieldCount)
         m_capi.destroyResult(resultSet);
         return NULL;
       }
+    }
+
+    // A length-coded value that ran past the packet latches the overflow flag.
+    if (m_reader.overflowed())
+    {
+      m_capi.destroyResult(resultSet);
+      return NULL;
     }
 
     m_capi.resultRowEnd(resultSet);

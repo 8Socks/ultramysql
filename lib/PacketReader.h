@@ -70,6 +70,9 @@ private:
   char *m_readCursor;
   char *m_writeCursor;
   char *m_packetEnd;
+  bool m_overflow;
+
+  bool ensure(size_t n);
 
 public:
 
@@ -82,6 +85,7 @@ public:
   char *getEndPtr();
   size_t getSize();
   bool havePacket();
+  bool overflowed();
 
   UINT8 readByte();
   UINT16 readShort();

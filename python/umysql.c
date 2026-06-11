@@ -139,6 +139,7 @@ void *API_createResult(int columns)
 {
   ResultSet *ret;
   ret = PyObject_New(ResultSet, &ResultSetType);
+  if (ret == NULL) return NULL;
   ResultSet_setup(ret, columns);
 
   return ret;
@@ -575,6 +576,7 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
       {
         //FIXME: Too fucking slow
         PyObject *sobj = PyBytes_FromStringAndSize((char *) value, cbValue);
+        if (sobj == NULL) break;   /* valobj stays NULL -> handled as conversion error */
         valobj = UM_FLOAT_FROM_STRING (sobj);
         Py_DECREF(sobj);
         break;

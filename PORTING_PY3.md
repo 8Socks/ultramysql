@@ -148,10 +148,24 @@ values, control chars, and every selectable charset (no multibyte break-out --
 only single-byte and utf8 charsets are selectable). 8 user-input regression
 tests added.
 
-Remaining lower-severity hardening (NULL checks on `PyObject_Malloc`/`PyObject_New`,
-handshake fixed-offset reads, the broader assert-only bounds in `PacketReader`
-read primitives, `scramble()` over-read -- all malicious-SERVER only) is noted
-for follow-up.
+**Third pass -- protocol-parser hardening (malicious / MITM server).** Completed:
+- `PacketReader` now has a runtime overflow latch. Every read primitive
+  (`readByte`/`readShort`/`readINT24`/`readLong`/`readNTString`/`readBytes`/
+  `readLengthCodedInteger`/`readLengthCodedBinary`) bounds-checks against the
+  packet end via `ensure()` and returns a safe 0/NULL instead of reading out of
+  bounds; the old bounds were `assert()`-only (stripped under `NDEBUG`).
+- The handshake parser checks `overflowed()` and NULL fields before the data
+  feeds `scramble()`/the auth response.
+- `scramble()` appended `_scramble1` as a C string (`seed += ptr`) and read past
+  the 8-byte buffer to the next NUL; now appends a fixed 8 bytes and is NULL-safe.
+- The result field/row loops abort on `overflowed()`; `createResult` and the
+  FLOAT decode now NULL-check their allocations.
+
+After all three passes: byte-identical to the original on py2, 75/75 compat, the
+89-test edge suite green on py2.7 and py3.9, and the upstream suite's
+connect/auth/type tests pass (a successful handshake exercises the hardened
+path). No known remaining memory-safety issues from either the param or the
+server surface.
 
 ## Known limitations / follow-ups
 
