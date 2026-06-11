@@ -72,6 +72,7 @@ PacketReader::PacketReader (size_t _cbSize)
   m_buffEnd = m_buffStart + _cbSize;
   m_readCursor = m_buffStart;
   m_packetEnd = NULL;
+  m_overflow = false;
 }
 
 PacketReader::~PacketReader (void)
@@ -94,6 +95,23 @@ void PacketReader::skip()
     m_writeCursor = m_buffStart;
     m_packetEnd = NULL;
   }
+}
+
+void PacketReader::freeSpace()
+{
+  // Compact: move the not-yet-read bytes to the front of the buffer so the space
+  // occupied by already-consumed packets is reclaimed. Without this, a result set
+  // larger than the rx buffer raises a spurious "Socket receive buffer full"
+  // (ported from ngandhy/ultramysql 2.63.7; the m_packetEnd recompute is fixed
+  // here -- the original used m_buffStart, producing a negative offset).
+  size_t len = m_writeCursor - m_readCursor;
+  memmove (m_buffStart, m_readCursor, len);
+
+  if (m_packetEnd != NULL)
+    m_packetEnd = m_buffStart + (m_packetEnd - m_readCursor);
+
+  m_writeCursor = m_buffStart + len;
+  m_readCursor = m_buffStart;
 }
 
 void PacketReader::push(size_t _cbData)
@@ -120,9 +138,32 @@ char *PacketReader::getEndPtr()
 extern void PrintBuffer(FILE *file, void *_offset, size_t len, int perRow);
 
 
+// Untrusted-input bounds. The asserts in the read primitives are stripped under
+// NDEBUG (the normal release/pip build), so each primitive routes through
+// ensure(): a read that would pass the packet end (or, while the 4-byte header
+// is being parsed, the received-data write cursor) is refused. The reader latches
+// an overflow flag and returns safe zero/NULL; callers check overflowed() and
+// abort the packet, and individual NULL returns are also checked at call sites.
+bool PacketReader::ensure(size_t n)
+{
+  char *limit = (m_packetEnd != NULL) ? m_packetEnd : m_writeCursor;
+  if (m_overflow || m_readCursor > limit || n > (size_t) (limit - m_readCursor))
+  {
+    m_overflow = true;
+    return false;
+  }
+  return true;
+}
+
+bool PacketReader::overflowed()
+{
+  return m_overflow;
+}
+
 bool PacketReader::havePacket()
 {
   m_packetEnd = NULL;
+  m_overflow = false;
 
   size_t len = (m_writeCursor - m_readCursor);
 
@@ -151,17 +192,13 @@ bool PacketReader::havePacket()
 
 UINT8 PacketReader::readByte()
 {
-  assert (m_readCursor + 1 <= m_packetEnd || m_packetEnd == NULL);
-  assert (m_packetEnd <= m_writeCursor);
-
+  if (!ensure(1)) return 0;
   return (*m_readCursor++);
 }
 
 UINT16 PacketReader::readShort()
 {
-  assert (m_readCursor + 2 <= m_packetEnd);
-  assert (m_packetEnd <= m_writeCursor);
-
+  if (!ensure(2)) return 0;
   UINT16 ret = BYTEORDER_UINT16(*((UINT16*)m_readCursor));
   m_readCursor += 2;
   return ret;
@@ -169,9 +206,7 @@ UINT16 PacketReader::readShort()
 
 UINT32 PacketReader::readINT24()
 {
-  assert (m_readCursor < m_packetEnd || m_packetEnd == NULL);
-  assert (m_packetEnd < m_writeCursor);
-
+  if (!ensure(3)) return 0;
   UINT32 ret = readByte() | (readByte() << 8) | (readByte() << 16);
 
   return ret;
@@ -179,9 +214,7 @@ UINT32 PacketReader::readINT24()
 
 UINT32 PacketReader::readLong()
 {
-  assert (m_readCursor + 4 <= m_packetEnd);
-  assert (m_packetEnd <= m_writeCursor);
-
+  if (!ensure(4)) return 0;
   UINT32 ret = BYTEORDER_UINT32(*((UINT32*)m_readCursor));
   m_readCursor += 4;
   return ret;
@@ -189,9 +222,6 @@ UINT32 PacketReader::readLong()
 
 char *PacketReader::readNTString()
 {
-  assert (m_readCursor < m_packetEnd);
-  assert (m_packetEnd <= m_writeCursor);
-
   char *ret = m_readCursor;
 
   while (m_readCursor < m_packetEnd)
@@ -202,15 +232,16 @@ char *PacketReader::readNTString()
     }
   }
 
-  assert (false);
+  // No NUL terminator inside the packet -- malformed/hostile. Flag and return
+  // NULL so callers do not consume an unterminated string.
+  m_overflow = true;
   return NULL;
 }
 
 
 UINT8 *PacketReader::readBytes(size_t cbsize)
 {
-  assert (m_readCursor + cbsize <= m_packetEnd);
-  assert (m_packetEnd <= m_writeCursor);
+  if (!ensure(cbsize)) return NULL;
 
   UINT8 *ret = (UINT8 *) m_readCursor;
   m_readCursor += cbsize;
@@ -231,8 +262,17 @@ void PacketReader::rewind(size_t num)
 
 UINT8 *PacketReader::readLengthCodedBinary(size_t *_outLen)
 {
-  assert (m_readCursor < m_packetEnd);
+  // Untrusted input. The asserts below are stripped under NDEBUG (the normal
+  // release/pip build), so every read is validated against the packet end at
+  // runtime here. A malformed/hostile packet yields NULL/truncated data rather
+  // than an out-of-bounds read (memory disclosure / crash).
   assert (m_packetEnd <= m_writeCursor);
+
+  if (m_readCursor >= m_packetEnd)
+  {
+    *_outLen = 0;
+    return NULL;
+  }
 
   switch (*((UINT8 *) m_readCursor))
   {
@@ -247,29 +287,40 @@ UINT8 *PacketReader::readLengthCodedBinary(size_t *_outLen)
     return NULL;
 
   case 252:
+    if (m_readCursor + 3 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT16 *) m_readCursor);
-    m_readCursor += 2; 
+    m_readCursor += 2;
     break;
 
   case 253:
+    if (m_readCursor + 4 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT32 *) m_readCursor);
     *_outLen &= 0xffffff;
-    m_readCursor += 3; 
+    m_readCursor += 3;
     break;
 
   case 254:
+    if (m_readCursor + 9 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT64 *) m_readCursor);
-    m_readCursor += 8; 
+    m_readCursor += 8;
     break;
+  }
+
+  // Clamp the payload length to the bytes actually remaining in the packet, so
+  // the returned (pointer, length) can never reference memory past m_packetEnd.
+  {
+    size_t avail = (size_t) (m_packetEnd - m_readCursor);
+    if (*_outLen > avail)
+    {
+      *_outLen = avail;
+    }
   }
 
   UINT8 *ret = (UINT8*) m_readCursor;
   m_readCursor += (*_outLen);
-
-  assert (m_readCursor <= m_packetEnd);
 
   return ret;
 }
@@ -282,45 +333,42 @@ size_t PacketReader::getSize()
 
 UINT64 PacketReader::readLengthCodedInteger()
 {
-  assert (m_readCursor < m_packetEnd);
-  assert (m_packetEnd <= m_writeCursor);
-
   UINT64 ret;
+
+  if (!ensure(1)) return 0;
 
   switch (*((UINT8 *) m_readCursor))
   {
   default:
     ret = (UINT64) *((UINT8 *) m_readCursor);
     m_readCursor ++;
-    assert (m_readCursor <= m_packetEnd);
     return ret;
 
   case 251:
     ret = 0;
     m_readCursor ++;
-    assert (m_readCursor <= m_packetEnd);
     return ret;
 
   case 252:
+    if (!ensure(3)) return 0;
     m_readCursor ++;
     ret = (UINT64) *((UINT16 *) m_readCursor);
     m_readCursor += 2;
-    assert (m_readCursor <= m_packetEnd);
     return ret;
 
   case 253:
+    if (!ensure(4)) return 0;
     m_readCursor ++;
     ret = (UINT64) *((UINT32 *) m_readCursor);
     ret &= 0xffffff;
     m_readCursor += 3;
-    assert (m_readCursor <= m_packetEnd);
     return ret;
 
   case 254:
+    if (!ensure(9)) return 0;
     m_readCursor ++;
     ret = (UINT64) *((UINT64 *) m_readCursor);
     m_readCursor += 8;
-    assert (m_readCursor <= m_packetEnd);
     return ret;
   }
 

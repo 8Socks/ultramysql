@@ -59,6 +59,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <umysql.h>
 #include <Python.h>
+#include "py3compat.h"
 #include <stdio.h>
 #include <socketdefs.h>
 
@@ -151,7 +152,7 @@ int API_setTimeout(void *sock, int timeoutSec)
   PRINTMARK();
   intobj = PyFloat_FromDouble( (double) timeoutSec);
 
-  methodObj = PyString_FromString("settimeout");
+  methodObj = UM_NATIVE_STR("settimeout");
   PRINTMARK();
   retobj = PyObject_CallMethodObjArgs ((PyObject *) sock, methodObj, intobj, NULL);
   Py_DECREF(intobj);
@@ -196,10 +197,10 @@ int API_connectSocket(void *sock, const char *host, int port)
   PRINTMARK();
 
   addrTuple = PyTuple_New(2);
-  PyTuple_SET_ITEM(addrTuple, 0, PyString_FromString(host));
+  PyTuple_SET_ITEM(addrTuple, 0, UM_NATIVE_STR(host));
   PyTuple_SET_ITEM(addrTuple, 1, PyInt_FromLong(port));
 
-  connectStr = PyString_FromString("connect");
+  connectStr = UM_NATIVE_STR("connect");
   res = PyObject_CallMethodObjArgs( (PyObject *) sock, connectStr, addrTuple, NULL);
 
   Py_DECREF(connectStr);
@@ -224,7 +225,7 @@ int API_recvSocket(void *sock, char *buffer, int cbBuffer)
   PyObject *funcStr;
   int ret;
 
-  funcStr = PyString_FromString("recv");
+  funcStr = UM_NATIVE_STR("recv");
   bufSize = PyInt_FromLong(cbBuffer);
   res = PyObject_CallMethodObjArgs ((PyObject *) sock, funcStr, bufSize, NULL);
   Py_DECREF(funcStr);
@@ -235,8 +236,8 @@ int API_recvSocket(void *sock, char *buffer, int cbBuffer)
     return -1;
   }
 
-  ret = (int) PyString_GET_SIZE(res);
-  memcpy (buffer, PyString_AS_STRING(res), ret);
+  ret = (int) PyBytes_GET_SIZE(res);
+  memcpy (buffer, PyBytes_AS_STRING(res), ret);
   Py_DECREF(res);
   return ret;
 }
@@ -248,8 +249,8 @@ int API_sendSocket(void *sock, const char *buffer, int cbBuffer)
   PyObject *funcStr;
   int ret;
 
-  funcStr = PyString_FromString("send");
-  pybuffer = PyString_FromStringAndSize(buffer, cbBuffer);
+  funcStr = UM_NATIVE_STR("send");
+  pybuffer = PyBytes_FromStringAndSize(buffer, cbBuffer);
   res = PyObject_CallMethodObjArgs ((PyObject *) sock, funcStr, pybuffer, NULL);
   Py_DECREF(funcStr);
   Py_DECREF(pybuffer);

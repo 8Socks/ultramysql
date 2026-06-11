@@ -1,0 +1,106 @@
+name: wheels
+
+# Build manylinux wheels for cp27 + cp39 on x86_64 + aarch64, plus an sdist.
+# Nothing is published unless the run is dispatched with `publish` set to
+# testpypi or pypi -- a plain run only builds and uploads artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish target (none = build only)'
+        type: choice
+        options: [none, testpypi, pypi]
+        default: none
+
+jobs:
+  build_py3:
+    name: py3 wheels (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU (cross-arch)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+      - name: Build cp39 wheels
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: cp39-*
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_TEST_COMMAND: python -c "import umysql; print(umysql.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cp39-${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+
+  build_py2:
+    name: py2.7 wheels (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU (cross-arch)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'   # host interpreter that RUNS cibuildwheel 1.x
+      - name: Build cp27 wheels (last py2.7-capable cibuildwheel)
+        run: |
+          pip install "cibuildwheel==1.12.0"
+          cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: cp27-*
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
+          CIBW_TEST_COMMAND: python -c "import umysql; print(umysql.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cp27-${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./dist/*.tar.gz
+
+  publish:
+    name: publish to ${{ inputs.publish }}
+    needs: [build_py3, build_py2, sdist]
+    if: inputs.publish != 'none'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.publish == 'pypi' && 'pypi' || 'testpypi' }}
+    permissions:
+      id-token: write   # OIDC for PyPI Trusted Publishing (no stored token)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        if: inputs.publish == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Publish to TestPyPI
+        if: inputs.publish == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/

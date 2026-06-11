@@ -1,2 +1,10 @@
 /build
 *.pyc
+
+*.so
+*.o
+build/
+
+# local scratch tooling (box-specific, not for the public repo)
+build_both.sh
+probe_boundaries.py

@@ -57,7 +57,12 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-from distutils.core import setup, Extension
+try:
+    # setuptools is preferred and is the only option on Python 3.12+,
+    # where distutils was removed from the standard library.
+    from setuptools import setup, Extension
+except ImportError:
+    from distutils.core import setup, Extension
 import shutil
 import sys
 
@@ -93,15 +98,15 @@ module1 = Extension('umysql',
                 libraries=libs,
                 define_macros=[('WIN32_LEAN_AND_MEAN', None)])
 					
-setup (name = 'umysql',
-       version = "2.61",
-       description = "Ultra fast MySQL driver for Python",
+setup (name = 'umysql-2018',
+       version = "3.0.0",
+       description = "Ultra fast MySQL driver for Python 2 and 3 (umysql-2018, Python 3 port)",
        ext_modules = [module1],
        author="Jonas Tarnstrom",
        author_email="jonas.tarnstrom@esn.me",
-       download_url="http://github.com/esnme/ultramysql",
+       url="https://github.com/ngandhy/ultramysql",
+       download_url="https://github.com/ngandhy/ultramysql",
        license="BSD License",
-       platforms=['any'],	   
-	   url="http://www.esn.me",
+       platforms=['any'],
        classifiers=CLASSIFIERS,
-	   )       
+       )

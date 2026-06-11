@@ -59,6 +59,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <umysql.h>
 #include <Python.h>
+#include "py3compat.h"
 #include <structmember.h>
 #include <stdio.h>
 #include <string.h>
@@ -118,7 +119,7 @@ typedef struct {
   int txBufferSize;
   int rxBufferSize;
   int charset;
-  PyObject *(*PFN_PyUnicode_Encode)(const Py_UNICODE *data, Py_ssize_t length, const char *errors);
+  const char *charset_name;   /* Python codec name, e.g. "utf-8"; used to encode unicode query/params */
 } Connection;
 
 void *API_getSocket();
@@ -138,6 +139,7 @@ void *API_createResult(int columns)
 {
   ResultSet *ret;
   ret = PyObject_New(ResultSet, &ResultSetType);
+  if (ret == NULL) return NULL;
   ResultSet_setup(ret, columns);
 
   return ret;
@@ -146,7 +148,17 @@ void *API_createResult(int columns)
 void API_resultSetField(void *result, int column, UMTypeInfo *ti, void *_name, size_t _cbName)
 {
   PyObject *field = PyTuple_New(2);
-  PyTuple_SET_ITEM(field, 0, PyString_FromStringAndSize((const char *)_name, _cbName));
+  PyObject *nameobj = UM_NATIVE_STR_N((const char *)_name, _cbName);
+  if (nameobj == NULL)
+  {
+    // On py3 UM_NATIVE_STR_N is a strict UTF-8 decode, which returns NULL and sets
+    // an exception for a non-UTF-8 column name (e.g. a latin1 connection, or odd
+    // alias bytes). Don't store NULL into the tuple or leak the exception across
+    // the C boundary -- fall back to the raw bytes so a name always exists.
+    PyErr_Clear();
+    nameobj = PyBytes_FromStringAndSize((const char *)_name, _cbName);
+  }
+  PyTuple_SET_ITEM(field, 0, nameobj);
   PyTuple_SET_ITEM(field, 1, PyInt_FromLong(ti->type));
   PyTuple_SET_ITEM(((ResultSet *) result)->fields, column, field);
   PRINTMARK();
@@ -506,7 +518,7 @@ static PyObject *DecodeString (UMTypeInfo *ti, char *value, size_t cbValue)
     break;
 
   case MCS_binary:
-    return PyString_FromStringAndSize(value, cbValue);
+    return PyBytes_FromStringAndSize(value, cbValue);
 
   default:
     break;
@@ -573,8 +585,9 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
     case MFTYPE_DOUBLE:
       {
         //FIXME: Too fucking slow
-        PyObject *sobj = PyString_FromStringAndSize((char *) value, cbValue);
-        valobj = PyFloat_FromString (sobj, NULL);
+        PyObject *sobj = PyBytes_FromStringAndSize((char *) value, cbValue);
+        if (sobj == NULL) break;   /* valobj stays NULL -> handled as conversion error */
+        valobj = UM_FLOAT_FROM_STRING (sobj);
         Py_DECREF(sobj);
         break;
       }
@@ -584,6 +597,13 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
         int year;
         int month;
         int day;
+
+        if (cbValue < 10)   /* "YYYY-MM-DD"; reject a short server value (OOB read) */
+        {
+          valobj = Py_None;
+          Py_IncRef(valobj);
+          break;
+        }
 
         year = parseINT32 (value, value + 4);
 
@@ -614,10 +634,17 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
         int minute;
         int second;
 
-        //9999-12-31 23:59:59
-        char temp[20];
-        memcpy (temp, value, cbValue);
-        temp[cbValue] = '\0';
+        //9999-12-31 23:59:59 (19 chars). The value is parsed directly from
+        //`value` below. Reject a short/oversized server value instead of the old
+        //`char temp[20]; memcpy(temp, value, cbValue)` -- that copy was never even
+        //read, yet a server-controlled cbValue>19 made it a remotely-triggerable
+        //stack buffer overflow.
+        if (cbValue < 19)
+        {
+          valobj = Py_None;
+          Py_IncRef(valobj);
+          break;
+        }
 
         year = parseINT32 (value, value + 4);
         value += 5;
@@ -657,7 +684,7 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
     case MFTYPE_LONG_BLOB:
     case MFTYPE_BLOB:
       if (ti->flags & MFFLAG_BINARY_FLAG) {
-        valobj = PyString_FromStringAndSize( (const char *) value, cbValue);
+        valobj = PyBytes_FromStringAndSize( (const char *) value, cbValue);
       } else {
         valobj = DecodeString (ti, value, cbValue);
       }
@@ -670,14 +697,22 @@ int API_resultRowValue(void *result, int column, UMTypeInfo *ti, char *value, si
       valobj = DecodeString (ti, value, cbValue);
       break;
 
-    case MFTYPE_ENUM:
     case MFTYPE_GEOMETRY:
     case MFTYPE_BIT:
+      // Binary types: BIT is packed big-endian bytes, GEOMETRY is WKB. Neither is
+      // valid text, so they must NOT be UTF-8 decoded -- doing so raises
+      // UnicodeDecodeError on py3 for any non-ASCII byte (e.g. BIT(8)=0xFF).
+      valobj = PyBytes_FromStringAndSize( (const char *) value, cbValue);
+      break;
+
+    case MFTYPE_ENUM:
     case MFTYPE_NEWDECIMAL:
     case MFTYPE_SET:
     case MFTYPE_DECIMAL:
-      // Fall through for string encoding
-      valobj = PyString_FromStringAndSize( (const char *) value, cbValue);
+    case MFTYPE_JSON:
+      // Textual types -> str on py3, bytes on py2. JSON (MySQL 8, type 0xf5)
+      // arrives as UTF-8 JSON text; decode it like any other text column.
+      valobj = UM_NATIVE_STR_N( (const char *) value, cbValue);
       break;
 
     }
@@ -730,7 +765,7 @@ int Connection_init(Connection *self, PyObject *arg)
   self->Error = umysql_Error;
   self->SQLError = umysql_SQLError;
 
-  self->PFN_PyUnicode_Encode = NULL;
+  self->charset_name = "utf-8";
 
   if (PyErr_Occurred())
   {
@@ -769,10 +804,6 @@ PyObject *Connection_isConnected(Connection *self, PyObject *args)
   Py_RETURN_FALSE;
 }
 
-PyObject *PyUnicode_EncodeCP1250Helper(const Py_UNICODE *data, Py_ssize_t length, const char *errors)
-{
-  return PyUnicode_Encode (data, length, "cp1250", errors);
-}
 
 
 PyObject *HandleError(Connection *self, const char *funcName)
@@ -861,31 +892,34 @@ PyObject *Connection_connect(Connection *self, PyObject *args)
     if (strcmp (pstrCharset, "utf8") == 0)
     {
       self->charset = MCS_utf8_general_ci;
-      self->PFN_PyUnicode_Encode = PyUnicode_EncodeUTF8;
+      self->charset_name = "utf-8";
     }
     else
       if (strcmp (pstrCharset, "latin1") == 0)
       {
         self->charset = MCS_latin1_general_ci;
-        self->PFN_PyUnicode_Encode = PyUnicode_EncodeLatin1;
+        self->charset_name = "latin-1";
       }
       else
         if (strcmp (pstrCharset, "ascii") == 0)
         {
           self->charset = MCS_ascii_general_ci;
-          self->PFN_PyUnicode_Encode = PyUnicode_EncodeASCII;
+          self->charset_name = "ascii";
         }
         else
           if (strcmp (pstrCharset, "cp1250") == 0)
           {
             self->charset = MCS_cp1250_general_ci;
-            self->PFN_PyUnicode_Encode = PyUnicode_EncodeCP1250Helper;
+            self->charset_name = "cp1250";
           }
           else
             if (strcmp (pstrCharset, "utf8mb4") == 0)
             {
-              self->charset = MCS_utf8mb4_general_ci;
-              self->PFN_PyUnicode_Encode = PyUnicode_EncodeUTF8;
+              /* unicode_ci (224), not general_ci (45): match utf8mb4_unicode_ci
+                 tables so literal/column comparisons don't raise "illegal mix of
+                 collations" (ported from ngandhy/ultramysql 2.63.7). */
+              self->charset = MCS_utf8mb4_unicode_ci;
+              self->charset_name = "utf-8";
             }
             else
                {
@@ -895,7 +929,7 @@ PyObject *Connection_connect(Connection *self, PyObject *args)
   else
   {
     self->charset = MCS_utf8_general_ci;
-    self->PFN_PyUnicode_Encode = PyUnicode_EncodeUTF8;
+    self->charset_name = "utf-8";
   }
 
   if (!UMConnection_Connect (self->conn, host, port, username, password, database, acObj ? &autoCommit : NULL, self->charset))
@@ -914,11 +948,17 @@ int AppendAndEscapeString(char *buffStart, char *buffEnd, const char *strStart, 
 
   if (quote)
   {
+    if (buffOffset >= buffEnd) return -1;
     (*buffOffset++) = '\'';
   }
 
   while (strStart < strEnd)
   {
+    /* Each branch writes at most 2 bytes. Bound-check before every iteration so
+       an undersized output buffer can never be overflowed: return -1 and the
+       caller fails the query. Defense-in-depth against any size-estimate error
+       (incl. a side-effecting __str__ that changes between sizing and writing). */
+    if (buffOffset + 2 > buffEnd) return -1;
     switch (*strStart)
     {
     case '\0':	// NULL
@@ -967,10 +1007,41 @@ int AppendAndEscapeString(char *buffStart, char *buffEnd, const char *strStart, 
 
   if (quote)
   {
+    if (buffOffset >= buffEnd) return -1;
     (*buffOffset++) = '\'';
   }
 
   return (int) (buffOffset - buffStart);
+}
+
+/* A str()-rendered fallback arg is emitted UNQUOTED only when it is a bare
+   numeric literal (digits, sign, decimal point, exponent). Those bytes cannot
+   contain a quote, space, or SQL keyword, so they cannot break out of the
+   expression. Anything else -- a custom __str__, a collection, inf/nan, an int
+   subclass returning SQL -- is quoted+escaped into an inert string literal,
+   preventing SQL injection via a non-string param object. */
+static int UM_IsBareNumeric(const char *s, Py_ssize_t n)
+{
+  Py_ssize_t i;
+  int hasDigit = 0;
+  if (n <= 0) return 0;
+  for (i = 0; i < n; i++)
+  {
+    char ch = s[i];
+    if (ch >= '0' && ch <= '9') { hasDigit = 1; continue; }
+    if (ch == '+' || ch == '-')
+    {
+      // A sign is numeric only at the very start or right after an exponent marker.
+      // Anywhere else (e.g. "1--") it is not a number and must be quoted -- otherwise
+      // an unquoted "--" would inject a comment into the surrounding statement. Real
+      // int/float/Decimal output never has a sign in any other position.
+      if (i == 0 || s[i - 1] == 'e' || s[i - 1] == 'E') continue;
+      return 0;
+    }
+    if (ch == '.' || ch == 'e' || ch == 'E') continue;
+    return 0;
+  }
+  return hasDigit;
 }
 
 int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
@@ -982,16 +1053,16 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
   FIXME: Surround strings with '' could be performed in this function to avoid extra logic in AppendAndEscapeString */
   PRINTMARK();
 
-  if (PyString_Check(obj))
+  if (PyBytes_Check(obj))
   {
     PRINTMARK();
-    return AppendAndEscapeString(start, end, PyString_AS_STRING(obj), PyString_AS_STRING(obj) + PyString_GET_SIZE(obj), TRUE);
+    return AppendAndEscapeString(start, end, PyBytes_AS_STRING(obj), PyBytes_AS_STRING(obj) + PyBytes_GET_SIZE(obj), TRUE);
   }
   else
     if (PyUnicode_Check(obj))
     {
       PRINTMARK();
-      strobj = self->PFN_PyUnicode_Encode(PyUnicode_AS_UNICODE(obj), PyUnicode_GET_SIZE(obj), NULL);
+      strobj = PyUnicode_AsEncodedString(obj, self->charset_name, "strict");
 
       if (strobj == NULL)
       {
@@ -1005,7 +1076,7 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
       }
 
 
-      ret = AppendAndEscapeString(start, end, PyString_AS_STRING(strobj), PyString_AS_STRING(strobj) + PyString_GET_SIZE(strobj), TRUE);
+      ret = AppendAndEscapeString(start, end, PyBytes_AS_STRING(strobj), PyBytes_AS_STRING(strobj) + PyBytes_GET_SIZE(strobj), TRUE);
       Py_DECREF(strobj);
 
       return ret;
@@ -1013,6 +1084,7 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
     else
       if (obj == Py_None)
       {
+        if (end - start < 4) return -1;
         (*start++) = 'n';
         (*start++) = 'u';
         (*start++) = 'l';
@@ -1020,9 +1092,25 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
         return  4;
       }
       else
+      if (obj == Py_True || obj == Py_False)
+      {
+        /* bool -> unquoted 1/0 (numeric). Without this, a bool would fall to the
+           str() fallback and be quoted as 'True'/'False' -- the right security
+           default for unknown objects, but wrong for a genuine boolean. */
+        if (end - start < 1) return -1;
+        (*start++) = (obj == Py_True) ? '1' : '0';
+        return 1;
+      }
+      else
         if (PyDateTime_Check(obj))
         {
-          int len = sprintf (start, "'%04d-%02d-%02d %02d:%02d:%02d'", 
+          /* Output is fixed-width "'YYYY-MM-DD HH:MM:SS'" = 21 bytes (year is
+             constrained to 1-9999 by Python). Verify the reserved space first so
+             a datetime subclass with a shrinking __str__ (which undersizes the
+             per-arg estimate) fails rather than overflowing. */
+          int len;
+          if (end - start < 24) return -1;
+          len = sprintf (start, "'%04d-%02d-%02d %02d:%02d:%02d'",
             PyDateTime_GET_YEAR(obj),
             PyDateTime_GET_MONTH(obj),
             PyDateTime_GET_DAY(obj),
@@ -1035,7 +1123,9 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
         else
           if (PyDate_Check(obj))
           {
-            int len = sprintf (start, "'%04d:%02d:%02d'", 
+            int len;
+            if (end - start < 16) return -1;   /* "'YYYY:MM:DD'" = 12 bytes */
+            len = sprintf (start, "'%04d:%02d:%02d'",
               PyDateTime_GET_YEAR(obj),
               PyDateTime_GET_MONTH(obj),
               PyDateTime_GET_DAY(obj));
@@ -1046,7 +1136,21 @@ int AppendEscapedArg (Connection *self, char *start, char *end, PyObject *obj)
           //FIXME: Might possible to avoid this?
           PRINTMARK();
           strobj = PyObject_Str(obj);
-          ret = AppendAndEscapeString(start, end, PyString_AS_STRING(strobj), PyString_AS_STRING(strobj) + PyString_GET_SIZE(strobj), FALSE);
+          if (strobj == NULL) return -1;   /* a param whose __str__ raises must not NULL-deref */
+#if PY_MAJOR_VERSION >= 3
+          /* py3 str(obj) is unicode -- encode to bytes for the byte buffer */
+          {
+            PyObject *bytesobj = PyUnicode_AsEncodedString(strobj, self->charset_name, "strict");
+            Py_DECREF(strobj);
+            strobj = bytesobj;
+            if (strobj == NULL) return -1;
+          }
+#endif
+          /* Unquoted only for a genuine numeric literal; quote+escape everything
+             else so an attacker-influenced non-string param object (custom
+             __str__, int subclass, list/dict, inf/nan, ...) cannot inject SQL. */
+          ret = AppendAndEscapeString(start, end, PyBytes_AS_STRING(strobj), PyBytes_AS_STRING(strobj) + PyBytes_GET_SIZE(strobj),
+                                      UM_IsBareNumeric(PyBytes_AS_STRING(strobj), PyBytes_GET_SIZE(strobj)) ? FALSE : TRUE);
           Py_DECREF(strobj);
           return ret;
 }
@@ -1066,9 +1170,13 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
 
   // Estimate output length
 
-  cbOutQuery += PyString_GET_SIZE(inQuery);
+  cbOutQuery += PyBytes_GET_SIZE(inQuery);
 
   iterator = PyObject_GetIter(iterable);
+  if (iterator == NULL)
+  {
+    return NULL;   /* a params object whose __iter__ raises must not NULL-deref */
+  }
 
   while ( (arg = PyIter_Next(iterator)))
   {
@@ -1076,13 +1184,39 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
     cbOutQuery += 2;
 
     // Worst case escape and utf-8
-    if (PyString_Check(arg))
-      cbOutQuery += (PyString_GET_SIZE(arg) * 2);
+    if (PyBytes_Check(arg))
+      cbOutQuery += (PyBytes_GET_SIZE(arg) * 2);
     else
       if (PyUnicode_Check(arg))
-        cbOutQuery += (PyUnicode_GET_SIZE(arg) * 6);
+        cbOutQuery += (UM_UNICODE_LEN(arg) * 6);
       else
-        cbOutQuery += 64;
+      {
+        /* Non-string args are rendered via PyObject_Str in AppendEscapedArg (and
+           UTF-8/charset-encoded on py3). Size the reservation from the actual
+           ENCODED byte length (x2 worst-case escaping + margin), NOT the
+           code-point count -- a multibyte str() is more bytes than code points.
+           AppendAndEscapeString is hard-bounded too, so this is just the fast
+           path; the bound is the backstop if str() is non-deterministic. */
+        PyObject *strtmp = PyObject_Str(arg);
+        if (strtmp == NULL)
+        {
+          PyErr_Clear();
+          cbOutQuery += 64;
+        }
+        else
+        {
+          Py_ssize_t nbytes;
+#if PY_MAJOR_VERSION >= 3
+          PyObject *enc = PyUnicode_AsEncodedString(strtmp, self->charset_name, "strict");
+          if (enc == NULL) { PyErr_Clear(); nbytes = PyUnicode_GET_LENGTH(strtmp) * 4; }
+          else { nbytes = PyBytes_GET_SIZE(enc); Py_DECREF(enc); }
+#else
+          nbytes = PyBytes_GET_SIZE(strtmp);
+#endif
+          cbOutQuery += (nbytes * 2) + 16;
+          Py_DECREF(strtmp);
+        }
+      }
 
     Py_DECREF(arg);
   }
@@ -1103,12 +1237,17 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
 
 
   optr = obuffer;
-  iptr = PyString_AS_STRING(inQuery);
+  iptr = PyBytes_AS_STRING(inQuery);
 
   hasArg = 0;
 
 
   iterator = PyObject_GetIter(iterable);
+  if (iterator == NULL)
+  {
+    if (heap) PyObject_Free(obuffer);
+    return NULL;   /* __iter__ that raises on the 2nd pass must not NULL-deref */
+  }
 
   while (1)
   {
@@ -1169,7 +1308,7 @@ PyObject *EscapeQueryArguments(Connection *self, PyObject *inQuery, PyObject *it
 END_PARSE:
   Py_DECREF(iterator);
 
-  retobj = PyString_FromStringAndSize (obuffer, (optr - obuffer));
+  retobj = PyBytes_FromStringAndSize (obuffer, (optr - obuffer));
 
   if (heap)
   {
@@ -1212,7 +1351,7 @@ PyObject *Connection_query(Connection *self, PyObject *args)
     Py_DECREF(iterator);
   }
 
-  if (!PyString_Check(inQuery))
+  if (!PyBytes_Check(inQuery))
   {
     if (!PyUnicode_Check(inQuery))
     {
@@ -1220,7 +1359,7 @@ PyObject *Connection_query(Connection *self, PyObject *args)
       return PyErr_Format(PyExc_TypeError, "Query argument must be either String or Unicode");
     }
 
-    query = self->PFN_PyUnicode_Encode(PyUnicode_AS_UNICODE(inQuery), PyUnicode_GET_SIZE(inQuery), NULL);
+    query = PyUnicode_AsEncodedString(inQuery, self->charset_name, "strict");
 
     if (query == NULL)
     {
@@ -1261,7 +1400,7 @@ PyObject *Connection_query(Connection *self, PyObject *args)
     escapedQuery = query;
   }
 
-  ret =  UMConnection_Query(self->conn, PyString_AS_STRING(escapedQuery), PyString_GET_SIZE(escapedQuery));
+  ret =  UMConnection_Query(self->conn, PyBytes_AS_STRING(escapedQuery), PyBytes_GET_SIZE(escapedQuery));
 
   Py_DECREF(escapedQuery);
 
@@ -1314,8 +1453,7 @@ static PyMemberDef Connection_members[] = {
 
 
 static PyTypeObject ConnectionType = { 
-  PyObject_HEAD_INIT(NULL)
-  0,				/* ob_size        */
+  PyVarObject_HEAD_INIT(NULL, 0)
   "umysql.Connection",		/* tp_name        */
   sizeof(Connection),		/* tp_basicsize   */
   0,				/* tp_itemsize    */
@@ -1410,8 +1548,7 @@ static PyMemberDef ResultSet_members[] = {
 };
 
 static PyTypeObject ResultSetType = { 
-  PyObject_HEAD_INIT(NULL)
-  0,				/* ob_size        */
+  PyVarObject_HEAD_INIT(NULL, 0)
   "umysql.ResultSet",		/* tp_name        */
   sizeof(ResultSet),		/* tp_basicsize   */
   0,				/* tp_itemsize    */
@@ -1453,34 +1590,71 @@ static PyMethodDef methods[] = {
   {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
-PyMODINIT_FUNC
-  initumysql(void) 
+#if PY_MAJOR_VERSION >= 3
+static struct PyModuleDef umysql_moduledef = {
+  PyModuleDef_HEAD_INIT,
+  "umysql",   /* m_name */
+  "",         /* m_doc */
+  -1,         /* m_size: no per-interpreter state */
+  methods,    /* m_methods */
+  NULL, NULL, NULL, NULL
+};
+#endif
+/* umysql_module_init always returns PyObject* (the module or NULL); the py2
+   entry point ignores the value, so returning NULL on error is correct on both. */
+#define UM_INIT_ERROR return NULL
+
+/* Shared init body for both py2 (initumysql) and py3 (PyInit_umysql). */
+static PyObject *umysql_module_init(void)
 {
   PyObject* m;
   PyObject *dict;
   PyDateTime_IMPORT;
 
+#if PY_MAJOR_VERSION >= 3
+  m = PyModule_Create(&umysql_moduledef);
+#else
   m = Py_InitModule3("umysql", methods, "");
+#endif
   if (m == NULL)
-    return;
+    UM_INIT_ERROR;
 
   dict = PyModule_GetDict(m);
 
   ConnectionType.tp_new = PyType_GenericNew;
   if (PyType_Ready(&ConnectionType) < 0)
-    return;
+    UM_INIT_ERROR;
   Py_INCREF(&ConnectionType);
   PyModule_AddObject(m, "Connection", (PyObject *)&ConnectionType);
 
   ResultSetType.tp_new = PyType_GenericNew;
   if (PyType_Ready(&ResultSetType) < 0)
-    return;
+    UM_INIT_ERROR;
   Py_INCREF(&ResultSetType);
   PyModule_AddObject(m, "ResultSet", (PyObject *)&ResultSetType);
 
+  /* PyExc_StandardError is remapped to PyExc_Exception on py3 in py3compat.h */
   umysql_Error = PyErr_NewException("umysql.Error", PyExc_StandardError, NULL);
   umysql_SQLError = PyErr_NewException("umysql.SQLError", umysql_Error, NULL);
 
   PyDict_SetItemString(dict, "Error", umysql_Error);
   PyDict_SetItemString(dict, "SQLError", umysql_SQLError);
+
+  /* 3.x = the Python 3 port (py3 support + security hardening + JSON decode).
+     Queryable at runtime so it is obvious which build is loaded. */
+  PyModule_AddStringConstant(m, "__version__", "3.0.0");
+
+  return m;
 }
+
+#if PY_MAJOR_VERSION >= 3
+PyMODINIT_FUNC PyInit_umysql(void)
+{
+  return umysql_module_init();
+}
+#else
+PyMODINIT_FUNC initumysql(void)
+{
+  umysql_module_init();
+}
+#endif

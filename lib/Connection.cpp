@@ -102,8 +102,12 @@ Connection::~Connection()
 void Connection::scramble(const char *_scramble1, const char *_scramble2, UINT8 _outToken[20])
 {
   std::string seed;
-  seed += _scramble1;
-  seed += _scramble2;
+  // _scramble1 is exactly 8 bytes and is NOT NUL-terminated -- append a fixed 8
+  // rather than `seed += ptr` (which would read past it to the next NUL).
+  // _scramble2 is NUL-terminated within the packet. Either may be NULL if the
+  // server sent a short/malformed handshake.
+  if (_scramble1 != NULL) seed.append(_scramble1, 8);
+  if (_scramble2 != NULL) seed += _scramble2;
 
   CSHA1 passdg;
   UINT8 stage1_hash[20];
@@ -139,9 +143,17 @@ bool Connection::readSocket()
 
   if (bytesToRecv == 0)
   {
-    // Socket buffer got full!
-    setError("Socket receive buffer full", 0, UME_OTHER);
-    return false;
+    // The write cursor reached the buffer end while earlier packets have already
+    // been consumed -- compact the buffer to reclaim that space and retry. Only a
+    // genuinely full buffer (a single value larger than the whole rx buffer) still
+    // errors. Fixes the "Socket receive buffer full" exception on results > 16MB.
+    m_reader.freeSpace();
+    bytesToRecv = m_reader.getEndPtr() - m_reader.getWritePtr();
+    if (bytesToRecv == 0)
+    {
+      setError("Socket receive buffer full", 0, UME_OTHER);
+      return false;
+    }
   }
   else
     if (bytesToRecv > 65536)
@@ -279,6 +291,15 @@ bool Connection::processHandshake()
     else
     {
       setError("Authentication < 4.1 not supported", 2, UME_OTHER);
+      return false;
+    }
+
+    // Untrusted handshake: bail out if any read ran past the packet (overflow
+    // latched) or a required field was malformed (NULL) before the data feeds
+    // scramble() / the auth response.
+    if (m_reader.overflowed() || serverVersion == NULL || scrambleBuff == NULL || scrambleBuff2 == NULL)
+    {
+      setError("Malformed handshake packet from server", 0, UME_OTHER);
       return false;
     }
 
@@ -590,7 +611,18 @@ void Connection::handleErrorPacket()
 
   UINT8 *message = m_reader.readBytes(len);
 
-  std::string errorMessage((char *) message, len);
+  // A truncated/malformed error packet can latch the reader's overflow guard so a
+  // read returns NULL while len stays positive (the failed read does not advance
+  // the cursor). std::string(NULL, len>0) is undefined behavior -- bail out with a
+  // generic message instead of dereferencing NULL. Reachable from the handshake
+  // path too, so a rogue server can otherwise crash the client on connect.
+  if (m_reader.overflowed() || (message == NULL && len > 0))
+  {
+    setError ("Malformed error packet from server", (int) errnum, UME_MYSQL);
+    return;
+  }
+
+  std::string errorMessage((char *) message, message ? len : 0);
   setError (errorMessage.c_str (), (int) errnum, UME_MYSQL);
 }
 
@@ -600,9 +632,23 @@ void *Connection::handleResultPacket(int _fieldCount)
   UINT64 fieldCount = m_reader.readLengthCodedInteger();
   m_reader.skip();
 
+  (void) _fieldCount;
+
+  // Untrusted: the field count comes straight off the wire. MySQL allows at most
+  // 4096 columns; reject anything outside [1, 4096] so the alloca below cannot be
+  // driven to stack-exhaustion and the per-field array/tuple writes stay bounded.
+  if (fieldCount < 1 || fieldCount > 4096)
+  {
+    return NULL;
+  }
+
   int iField = 0;
 
-  void *resultSet = m_capi.createResult(_fieldCount);
+  void *resultSet = m_capi.createResult((int) fieldCount);
+  if (resultSet == NULL)
+  {
+    return NULL;
+  }
 
   // Read Field packets
 
@@ -653,6 +699,14 @@ void *Connection::handleResultPacket(int _fieldCount)
 
     //UINT8 *def = m_reader.readLengthCodedBinary(&cb_default);
 
+    // Untrusted: the server decides how many field packets precede the 0xfe EOF.
+    // Never write past the fieldCount-sized typeInfo[] array or the fields tuple.
+    if (iTypeInfo >= (int) fieldCount)
+    {
+      m_capi.destroyResult(resultSet);
+      return NULL;
+    }
+
     typeInfo[iTypeInfo].type = type;
     typeInfo[iTypeInfo].flags = flags;
     typeInfo[iTypeInfo].charset = charset;
@@ -662,6 +716,14 @@ void *Connection::handleResultPacket(int _fieldCount)
     iField ++;
     m_reader.skip();
 
+  }
+
+  // Untrusted: require exactly fieldCount field packets (so every typeInfo[index]
+  // read in the row loop is initialized) and that no field read ran off a packet.
+  if (iTypeInfo != (int) fieldCount || m_reader.overflowed())
+  {
+    m_capi.destroyResult(resultSet);
+    return NULL;
   }
 
   // Read row data
@@ -692,7 +754,7 @@ void *Connection::handleResultPacket(int _fieldCount)
 
     m_capi.resultRowBegin(resultSet);
 
-    for (int index = 0; index < _fieldCount; index ++)
+    for (int index = 0; index < (int) fieldCount; index ++)
     {
       UINT8 *columnValue = m_reader.readLengthCodedBinary(&cb_column);
       if (!m_capi.resultRowValue (resultSet, index, &typeInfo[index], columnValue, cb_column))
@@ -700,6 +762,13 @@ void *Connection::handleResultPacket(int _fieldCount)
         m_capi.destroyResult(resultSet);
         return NULL;
       }
+    }
+
+    // A length-coded value that ran past the packet latches the overflow flag.
+    if (m_reader.overflowed())
+    {
+      m_capi.destroyResult(resultSet);
+      return NULL;
     }
 
     m_capi.resultRowEnd(resultSet);
