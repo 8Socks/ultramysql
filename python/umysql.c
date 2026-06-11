@@ -1618,6 +1618,10 @@ static PyObject *umysql_module_init(void)
   PyDict_SetItemString(dict, "Error", umysql_Error);
   PyDict_SetItemString(dict, "SQLError", umysql_SQLError);
 
+  /* 3.x = the Python 3 port (py3 support + security hardening + JSON decode).
+     Queryable at runtime so it is obvious which build is loaded. */
+  PyModule_AddStringConstant(m, "__version__", "3.0.0");
+
   return m;
 }
 

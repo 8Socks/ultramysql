@@ -1,5 +1,9 @@
 # Python 3 port of ultramysql (umysql)
 
+**Version `3.0.0`** -- the Python 3 line (py3 support + security hardening + JSON
+decode). Bumped from the original `2.61` so the build is unmistakable; queryable
+at runtime as `umysql.__version__`.
+
 This branch ports the umysql CPython extension to **Python 3** while keeping it
 building and working unchanged on **Python 2.7** (dual-version via
 `#if PY_MAJOR_VERSION >= 3` guards). The goal: keep umysql's two defining
@@ -162,7 +166,7 @@ tests added.
   FLOAT decode now NULL-check their allocations.
 
 After all three passes: byte-identical to the original on py2, 75/75 compat, the
-89-test edge suite green on py2.7 and py3.9, and the upstream suite's
+the edge suite green on py2.7 and py3.9, and the upstream suite's
 connect/auth/type tests pass (a successful handshake exercises the hardened
 path). No known remaining memory-safety issues from either the param or the
 server surface.

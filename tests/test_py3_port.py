@@ -1714,6 +1714,100 @@ class PortEdgeCases(unittest.TestCase):
         c.query('DROP PROCEDURE IF EXISTS sp_one'); c.close()
 
 
+    def test_gevent__pool_under_load(self):
+        # Mirrors the app's SQLAlchemy QueuePool over umysql under gevent: many
+        # greenlets concurrently check out / use / return pooled connections.
+        # Verifies (a) no cross-talk / corruption -- each greenlet gets its own
+        # result -- and (b) the pool stays gevent-cooperative (queries overlap).
+        if not HAVE_GEVENT:
+            self.skipTest('gevent not installed')
+        import sqlalchemy.pool as sapool
+        import time, gevent
+        def getconn():
+            return conn()
+        dbpool = sapool.QueuePool(getconn, pool_size=5, max_overflow=10, recycle=3600, reset_on_return=False)
+        N = 30
+        results = {}
+        errors = []
+        def worker(i):
+            try:
+                cnn = dbpool.connect()
+                try:
+                    rs = cnn.query('SELECT SLEEP(0.1), %s', (i,))
+                    results[i] = rs.rows[0][1]
+                finally:
+                    cnn.close()
+            except Exception as e:
+                errors.append((i, repr(e)))
+        t = time.time()
+        gevent.joinall([gevent.spawn(worker, i) for i in range(N)], timeout=30)
+        elapsed = time.time() - t
+        assert not errors, errors
+        assert len(results) == N, (len(results), N)
+        for i in range(N):
+            assert results.get(i) == i, ('cross-talk', i, results.get(i))
+        assert elapsed < 1.5, ('not cooperative through the pool', elapsed)
+
+    def test_exotic__bit64_and_binary(self):
+        import struct
+        c = conn()
+        c.query('DROP TABLE IF EXISTS ex1')
+        c.query('CREATE TABLE ex1(b64 bit(64), bin5 binary(5)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query("INSERT INTO ex1 (b64, bin5) VALUES (255, %s)", (b'abc',))
+        b64, bin5 = c.query('SELECT b64, bin5 FROM ex1').rows[0]
+        assert isinstance(b64, bytes) and len(b64) == 8, repr(b64)   # BIT(64) -> 8 bytes
+        assert struct.unpack('>Q', b64)[0] == 255, struct.unpack('>Q', b64)[0]
+        assert isinstance(bin5, bytes) and len(bin5) == 5, repr(bin5) # BINARY(5) NUL-padded
+        assert bin5 == b'abc' + b'\x00' * 2, repr(bin5)
+        c.query('DROP TABLE ex1'); c.close()
+
+    def test_exotic__set_and_enum(self):
+        c = conn()
+        c.query('DROP TABLE IF EXISTS ex2')
+        c.query("CREATE TABLE ex2(s set('a','b','c','d'), e enum('x','y','z')) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4")
+        c.query("INSERT INTO ex2 VALUES ('a,c,d', 'y')")
+        c.query("INSERT INTO ex2 VALUES ('', 'x')")          # empty SET
+        rows = c.query('SELECT s, e FROM ex2').rows
+        def dec(v):
+            return v.decode('utf-8') if isinstance(v, bytes) else v
+        assert dec(rows[0][0]) == 'a,c,d', repr(rows[0][0])  # SET members comma-joined
+        assert dec(rows[1][0]) == '', repr(rows[1][0])       # empty SET -> empty string
+        assert dec(rows[0][1]) == 'y', repr(rows[0][1])      # ENUM -> label
+        c.query('DROP TABLE ex2'); c.close()
+
+    def test_exotic__time_negative_and_large(self):
+        c = conn()
+        c.query('DROP TABLE IF EXISTS ex3')
+        c.query('CREATE TABLE ex3(t time) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        for v in ('-12:30:00', '120:00:00', '838:59:59', '-838:59:59'):  # full MySQL TIME range
+            c.query('DELETE FROM ex3')
+            c.query('INSERT INTO ex3 VALUES (%s)', (v,))
+            got = c.query('SELECT t FROM ex3').rows[0][0]
+            gs = got.decode('utf-8') if isinstance(got, bytes) else got
+            assert gs == v, (v, gs)   # TIME -> string, incl. negative and > 24h
+        c.query('DROP TABLE ex3'); c.close()
+
+    def test_exotic__zerofill_and_generated(self):
+        c = conn()
+        c.query('DROP TABLE IF EXISTS ex4')
+        c.query('CREATE TABLE ex4(z int(5) zerofill, n int, g int AS (n*2) STORED) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO ex4 (z, n) VALUES (42, 10)')
+        z, n, g = c.query('SELECT z, n, g FROM ex4').rows[0]
+        assert z == 42, repr(z)              # ZEROFILL is display-only -> int value
+        assert n == 10 and g == 20, (n, g)   # generated column computed server-side
+        c.query('DROP TABLE ex4'); c.close()
+
+    def test_exotic__unsigned_boundaries_and_highprec_decimal(self):
+        c = conn()
+        c.query('DROP TABLE IF EXISTS ex5')
+        c.query('CREATE TABLE ex5(ti tinyint unsigned, mi mediumint unsigned, d decimal(30,10)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO ex5 VALUES (255, 16777215, %s)', ('-12345678901234567890.0123456789',))
+        ti, mi, d = c.query('SELECT ti, mi, d FROM ex5').rows[0]
+        assert ti == 255 and mi == 16777215, (ti, mi)
+        ds = d.decode('utf-8') if isinstance(d, bytes) else d
+        assert ds == '-12345678901234567890.0123456789', repr(d)  # exact high-precision DECIMAL
+        c.query('DROP TABLE ex5'); c.close()
+
 
 if __name__ == "__main__":
     unittest.main()
