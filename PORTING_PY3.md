@@ -229,6 +229,42 @@ exercise the error path). Result, both py2 and py3: RSS flat across every 10k
 checkpoint (zero growth), all 200 error paths raised cleanly and the connection
 survived, final query healthy. No leaks, no drift, no anomalies.
 
+## Regression differential vs production 2.63.7
+
+`regression_diff.py` runs 71 probes -- scalar/typed round-trips of every MySQL
+type, an 18-value param-escaping matrix, write semantics (rowcount/lastrowid,
+found-rows UPDATE, ON DUPLICATE, multi-row), error codes, multi-row ordering,
+float-precision params, and the str()-fallback classes -- through the production
+`umysql-2018` 2.63.7 build (py2), the new 3.0.0 build (py2), and the new build
+(py3), comparing canonical output.
+
+**prod 2.63.7 vs new 3.0.0 on py2: byte-identical across 66 of 71 probes.** The 5
+differences are all intentional, and all are the new build being more capable or
+safer where prod errored -- none is a regression:
+- **JSON** decode (new feature; prod raises "Unable to convert field of type 245").
+- **str()-fallback hardening**: a non-numeric param object now renders as a quoted
+  literal instead of unquoted text -- `float('inf')`/`float('nan')` (prod: error
+  1054), `datetime.time`/`list`/`dict` (prod: error 1064). Plain numerics, bytes,
+  bool (1/0), and str are unchanged.
+
+**new py2 vs new py3** differs only in documented representation -- bytes-vs-str
+(DECIMAL/text-as-string), long-vs-int -- PLUS one behavior change worth calling out:
+
+- **Float param precision (py3).** Params with no dedicated branch fall through to
+  `str()`. py2 `str(float)` is `%.12g` (12 sig figs); py3 `str(float)` is the
+  shortest round-tripping repr (up to 17 figs). So a high-precision float param
+  writes a *different value*: `0.12345678901234567` is sent as `0.123456789012` on
+  py2/prod but `0.12345678901234566` on py3, and round-trips to different stored
+  doubles. Usually harmless (py3 is more precise) but it IS a change -- if you store
+  floats (coordinates, money) as params and depend on the exact value, pass a
+  pre-formatted string or a `Decimal` instead, or normalize float rendering in the
+  driver. Pinned by `fprec_*` probes in `regression_diff.py`.
+
+Also surfaced by the differential: prod 2.63.7 ships with C asserts live and
+**SIGABRTs the process** at the 16,777,211-byte single-value boundary, where the
+hardened build returns a catchable error instead -- a safety improvement (see the
+single-value limitation below), not diffable inline because prod aborts.
+
 ## Known limitations / follow-ups
 
 - `caching_sha2_password` is **not implemented** (this driver, like the original,
