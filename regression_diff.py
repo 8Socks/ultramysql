@@ -216,6 +216,88 @@ def main():
     emit('many_last', 'ml', lambda: rows_canon(Q('SELECT * FROM rd_many ORDER BY id DESC LIMIT 3')))
     emit('many_sum', 'ms', lambda: rows_canon(Q('SELECT SUM(id), COUNT(*) FROM rd_many')))
 
+    # ===================== MED / LOW coverage additions =====================
+
+    # Integer decode of every width as a COLUMN (literals arrive as LONGLONG -- a
+    # different switch arm than typed columns), incl. all UNSIGNED branches and 2^63.
+    Q('DROP TABLE IF EXISTS rd_ints')
+    Q('''CREATE TABLE rd_ints (
+        ti TINYINT, tiu TINYINT UNSIGNED, si SMALLINT, siu SMALLINT UNSIGNED,
+        mi MEDIUMINT, miu MEDIUMINT UNSIGNED, i INT, iu INT UNSIGNED,
+        bi BIGINT, biu BIGINT UNSIGNED) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
+    Q('INSERT INTO rd_ints VALUES (127,255,32767,65535,8388607,16777215,2147483647,4294967295,9223372036854775807,9223372036854775808)')
+    Q('INSERT INTO rd_ints (i, bi) VALUES (-2147483648, -9223372036854775808)')
+    emit('int_cols_max', 'imax', lambda: rows_canon(Q('SELECT * FROM rd_ints WHERE ti=127')))
+    emit('int_cols_min', 'imin', lambda: rows_canon(Q('SELECT i, bi FROM rd_ints WHERE i=-2147483648')))
+    Q('DROP TABLE rd_ints')
+
+    # rs.fields (name + type code) -- the port changed field-name materialization.
+    def fields_canon(rs):
+        return ';'.join('(' + canon(f[0]) + ',I:%d)' % f[1] for f in rs.fields)
+    emit('fields_basic', 'fb', lambda: fields_canon(Q('SELECT 1 AS a, 2.5 AS b, NULL AS c')))
+    emit('fields_alias', 'fa', lambda: fields_canon(Q('SELECT 1 AS col_named')))
+
+    # OK-packet length-coded fields: insert-id > 2^32, affected-rows >= 251.
+    Q('DROP TABLE IF EXISTS rd_bigid')
+    Q('CREATE TABLE rd_bigid (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+    Q('ALTER TABLE rd_bigid AUTO_INCREMENT=5000000000')
+    emit('bigid_insert', 'bi', lambda: 'W:%r' % (Q('INSERT INTO rd_bigid (v) VALUES (1)'),))
+    Q('DROP TABLE IF EXISTS rd_300'); Q('CREATE TABLE rd_300 (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+    Q('INSERT INTO rd_300 VALUES ' + ','.join('(%d)' % i for i in range(300)))
+    emit('affrows_300', 'a3', lambda: 'W:%r' % (Q('UPDATE rd_300 SET id=id'),))
+    Q('DROP TABLE rd_bigid'); Q('DROP TABLE rd_300')
+
+    # CALL (multi-result) + multi-statement -- umysql sets neither cap; error/parity.
+    Q('DROP PROCEDURE IF EXISTS rd_sp')
+    Q('CREATE PROCEDURE rd_sp() BEGIN SELECT 1 AS x; END')
+    emit('call_sp', 'cs', lambda: rows_canon(Q('CALL rd_sp()')))
+    emit('call_sp_reuse', 'csr', lambda: rows_canon(Q('SELECT 42')))
+    Q('DROP PROCEDURE rd_sp')
+    emit('multi_stmt', 'mst', lambda: rows_canon(Q('SELECT 1; SELECT 2')))
+
+    # result-set / value edges
+    emit('zero_rows', 'zr', lambda: 'rows=%d' % len(Q('SELECT 1 WHERE 1=0').rows))
+    emit('empty_blob', 'eb', lambda: rows_canon(Q("SELECT X''")))
+    emit('neg_zero', 'nz', lambda: rows_canon(Q('SELECT CAST(-0.0 AS DOUBLE)')))
+    emit('max_double', 'md', lambda: rows_canon(Q('SELECT CAST(1.7976931348623157e308 AS DOUBLE)')))
+    emit('coll_255', 'c255', lambda: rows_canon(Q("SELECT _utf8mb4'x' COLLATE utf8mb4_0900_ai_ci")))
+    emit('too_many_params', 'tmp', lambda: rows_canon(Q('SELECT %s', (1, 2, 3))))
+    emit('pct_collapse', 'pc', lambda: rows_canon(Q("SELECT '100%%'")))
+
+    # zero-date DECODE (year<1 -> None) under a permissive sql_mode
+    Q("SET SESSION sql_mode=''")
+    Q('DROP TABLE IF EXISTS rd_zd'); Q('CREATE TABLE rd_zd (d DATE, dt DATETIME) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+    Q("INSERT INTO rd_zd VALUES ('0000-00-00', '0000-00-00 00:00:00')")
+    emit('zero_date_decode', 'zd', lambda: rows_canon(Q('SELECT d, dt FROM rd_zd')))
+    emit('date_extremes', 'dx', lambda: rows_canon(Q("SELECT CAST('9999-12-31' AS DATE), CAST('0001-01-01' AS DATE)")))
+    Q('DROP TABLE rd_zd')
+
+    # connection-option / charset matrix (separate connections)
+    def with_conn(autocommit, charset, sql):
+        cc = umysql.Connection()
+        if charset is None:
+            cc.connect(H, P, U, PW, DB)
+        else:
+            cc.connect(H, P, U, PW, DB, autocommit, charset)
+        try:
+            return rows_canon(cc.query(sql))
+        finally:
+            cc.close()
+    emit('autocommit_off', 'ac', lambda: with_conn(False, 'utf8mb4', 'SELECT @@autocommit'))
+    emit('connect_5arg', '5a', lambda: with_conn(True, None, "SELECT 'ok'"))
+    for cs in ['utf8mb4', 'latin1', 'ascii', 'cp1250']:
+        emit('coll_' + cs, cs, (lambda x: (lambda: with_conn(True, x, 'SELECT @@collation_connection')))(cs))
+
+    # auth-failure error shape
+    def probe_authfail():
+        cc = umysql.Connection()
+        try:
+            cc.connect(H, P, 'no_such_user_zzz', 'bad_pw', DB, True, 'utf8mb4')
+            return 'CONNECTED?!'
+        except umysql.Error as e:
+            return 'AUTHERR code=%s' % (e.args[0],)
+    emit('auth_fail', 'af', probe_authfail)
+
     Q('DROP TABLE rd_types'); Q('DROP TABLE rd_w'); Q('DROP TABLE rd_many')
     getc().close()
 

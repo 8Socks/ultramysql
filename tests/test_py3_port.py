@@ -2098,6 +2098,24 @@ class PortEdgeCases(unittest.TestCase):
         except Exception:
             pass
 
+    def test_type_decode__fractional_seconds_no_crash(self):
+        # The production 2.63.7 build STACK-SMASHES (fixed char[20] overflowed by a
+        # 26-byte DATETIME(6)) on fractional-second types -- verified by the
+        # regression differential. This port bounds the buffer and handles them
+        # safely. Microseconds are dropped on DATETIME/TIMESTAMP (decoded to a
+        # whole-second datetime); TIME(6) passes through as a string. Pin the safe
+        # behavior so a regression toward the crash (or a buffer change) is caught.
+        c = conn()
+        c.query('DROP TABLE IF EXISTS frac')
+        c.query('CREATE TABLE frac (a DATETIME(6), b TIME(6), t TIMESTAMP(6) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query("INSERT INTO frac VALUES ('2026-06-11 13:45:09.123456','13:45:09.654321','2026-06-11 13:45:09.111222')")
+        a, b, t = c.query('SELECT a, b, t FROM frac').rows[0]
+        assert (a.year, a.month, a.day, a.hour, a.minute, a.second, a.microsecond) == (2026, 6, 11, 13, 45, 9, 0), a
+        bs = b.decode('ascii') if isinstance(b, bytes) else b
+        assert bs == '13:45:09.654321', bs   # TIME passes through as a string
+        assert (t.hour, t.minute, t.second, t.microsecond) == (13, 45, 9, 0), t
+        c.query('DROP TABLE frac'); c.close()
+
 
 if __name__ == "__main__":
     unittest.main()

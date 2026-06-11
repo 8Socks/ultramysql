@@ -231,14 +231,17 @@ survived, final query healthy. No leaks, no drift, no anomalies.
 
 ## Regression differential vs production 2.63.7
 
-`regression_diff.py` runs 71 probes -- scalar/typed round-trips of every MySQL
-type, an 18-value param-escaping matrix, write semantics (rowcount/lastrowid,
-found-rows UPDATE, ON DUPLICATE, multi-row), error codes, multi-row ordering,
-float-precision params, and the str()-fallback classes -- through the production
-`umysql-2018` 2.63.7 build (py2), the new 3.0.0 build (py2), and the new build
-(py3), comparing canonical output.
+`regression_diff.py` runs 96 probes -- scalar/typed round-trips of every MySQL
+type (incl. every integer width signed/unsigned as a column, `rs.fields`
+name+type, large insert-id and affected-rows >= 251, 0-row results, empty-blob,
+DOUBLE edges, collation 255, zero-date decode, date extremes), an 18-value
+param-escaping matrix, float-precision params, the str()-fallback classes, write
+semantics, error codes, CALL/multi-statement, the charset matrix and connect-option
+forms, and auth-failure shape -- through the production `umysql-2018` 2.63.7 build
+(py2), the new 3.0.0 build (py2), and the new build (py3), comparing canonical
+output.
 
-**prod 2.63.7 vs new 3.0.0 on py2: byte-identical across 66 of 71 probes.** The 5
+**prod 2.63.7 vs new 3.0.0 on py2: byte-identical across 91 of 96 probes.** The 5
 differences are all intentional, and all are the new build being more capable or
 safer where prod errored -- none is a regression:
 - **JSON** decode (new feature; prod raises "Unable to convert field of type 245").
@@ -260,10 +263,21 @@ safer where prod errored -- none is a regression:
   pre-formatted string or a `Decimal` instead, or normalize float rendering in the
   driver. Pinned by `fprec_*` probes in `regression_diff.py`.
 
-Also surfaced by the differential: prod 2.63.7 ships with C asserts live and
-**SIGABRTs the process** at the 16,777,211-byte single-value boundary, where the
-hardened build returns a catchable error instead -- a safety improvement (see the
-single-value limitation below), not diffable inline because prod aborts.
+Two prod **crashes** surfaced by the differential (both fixed by the port, neither
+diffable inline because prod aborts the process):
+- **`DATETIME(6)`/`TIMESTAMP(6)`/`TIME(6)` stack-smash.** Prod 2.63.7 decodes dates
+  into a fixed `char[20]`; a 26-byte fractional-second value overflows it and
+  triggers `*** stack smashing detected ***` (process terminated -- a
+  memory-corruption crash on any microsecond-precision datetime column). The port
+  bounds the buffer and returns safely (microseconds dropped on DATETIME/TIMESTAMP,
+  TIME(6) passed through as a string). Pinned by
+  `test_type_decode__fractional_seconds_no_crash`.
+- **16,777,211-byte single value.** Prod ships with C asserts live and SIGABRTs at
+  that boundary (see the single-value limitation below); the hardened build returns
+  a catchable error.
+
+These coverage gaps -- and the float-precision case above -- were identified by an
+independent (Fable) regression-coverage audit and then confirmed empirically.
 
 ## Known limitations / follow-ups
 
@@ -285,6 +299,12 @@ single-value limitation below), not diffable inline because prod aborts.
   connection across concurrent greenlets mid-query. Pre-existing (shared C core);
   pinned by `test_concurrency_gevent__*_corrupts_connection`. A proper fix would
   close/reset the connection on interrupted recv.
+- **Fractional seconds are dropped** on `DATETIME`/`TIMESTAMP` columns: a
+  `DATETIME(6)` value decodes to a whole-second `datetime` (microseconds lost).
+  `TIME(n)` is returned as a string with its fraction intact. This is the safe
+  replacement for prod's stack-smashing crash on these types; if you need
+  microsecond precision from a DATETIME column, select it as a string. Float params
+  similarly: see the py3 float-precision note above.
 - A `>65`-digit numeric literal sent to MySQL 8 hangs on py2 (the recv path);
   this reproduces on the *original* umysql too (pre-existing, not a port issue).
 - py3+gevent concurrency benchmark still to be run in a gevent-enabled env (the
