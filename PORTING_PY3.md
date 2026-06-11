@@ -169,10 +169,63 @@ server surface.
 
 ## Known limitations / follow-ups
 
-- Tested against `mysql_native_password` on MySQL 8. `caching_sha2_password`
-  (MySQL 8 default for new users) is not implemented by this driver and is a
-  separate piece of work if required.
+- `caching_sha2_password` is **not implemented** (this driver, like the original,
+  speaks only `mysql_native_password`). See "Authentication plugins" below.
 - A `>65`-digit numeric literal sent to MySQL 8 hangs on py2 (the recv path);
   this reproduces on the *original* umysql too (pre-existing, not a port issue).
 - py3+gevent concurrency benchmark still to be run in a gevent-enabled env (the
   cooperation property itself is verified on py2).
+
+## Authentication plugins (caching_sha2_password not implemented)
+
+This driver authenticates with **`mysql_native_password` only**. The original
+umysql does too -- `scramble()` is the native-password SHA1 algorithm and the
+handshake parser does not read the server's auth-plugin name. There is no support
+for `caching_sha2_password` (MySQL 8's default plugin for newly-created users).
+
+**You almost certainly do not need it for the Python 3 migration.** If the app
+authenticates against prod MySQL 8 today on the current umysql, those users are
+already configured with `mysql_native_password` (otherwise the current driver
+could not connect), and this port preserves that exactly. Confirm with:
+
+```sql
+SELECT user, plugin FROM mysql.user;
+```
+
+The real forcing function is **MySQL 8.4 / 9.0, which removes
+`mysql_native_password`**. Treat `caching_sha2_password` as a prerequisite for
+that server upgrade, NOT for the py3 cutover.
+
+### What implementing it would take
+
+`caching_sha2_password` is a multi-round-trip plugin with two server paths:
+
+1. **Fast path (password cached server-side):** add a self-contained SHA-256 (the
+   driver only has SHA1); the response is
+   `SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) + nonce)`; read the plugin name from
+   the handshake; handle the `0x03` "fast auth success" marker. ~1-2 days, no new
+   dependencies -- but incomplete on its own (a cache miss / first connect / post
+   server-restart hits the full path).
+2. **Full auth, TLS connection:** on the `0x04` "full auth required" marker, send
+   the cleartext password. Trivial -- but the driver has no TLS (it strips
+   `CLIENT_SSL`); adding TLS (wrap the Python socket in `ssl`; gevent patches it)
+   is its own feature.
+3. **Full auth, plaintext connection:** on `0x04`, request the server RSA public
+   key (`0x02`), receive the PEM, then **RSA-OAEP-encrypt** `pw XOR nonce`. Hard:
+   needs RSA-OAEP, i.e. a crypto dependency or a hand-rolled RSA -- security
+   sensitive and contrary to the driver's minimal-dependency design.
+
+### Recommended approach when it is actually needed
+
+Do **not** add an OpenSSL C link or write RSA in C. The driver already routes its
+I/O through a Python socket object, and the application already depends on
+`cryptography`/`pycryptodome`. So:
+
+- Implement **SHA-256 + the fast path + the auth state machine in C** (tier 1).
+- For the `0x04` full-auth RSA step, **call a small Python helper** (via the
+  C-API) that fetches the public key and does RSA-OAEP with `cryptography` -- a
+  few lines, well-tested, no new native dependency, CPU-only (gevent-safe).
+
+Rough estimate: fast-path only ~1-2 days; complete with the RSA step delegated to
+Python ~3-5 days; fully self-contained C (hand-rolled RSA) ~2 weeks plus
+crypto-review risk.
