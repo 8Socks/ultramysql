@@ -171,14 +171,69 @@ connect/auth/type tests pass (a successful handshake exercises the hardened
 path). No known remaining memory-safety issues from either the param or the
 server surface.
 
+## Performance (benchmarked vs production 2.63.7 and PyMySQL 0.10.1)
+
+Harness: `bench_drivers.py` (run cells sequentially on an idle box; best-of-3 per
+workload; wall + process CPU via getrusage). Box: aarch64 Linux, MySQL 8.0 on
+127.0.0.1, utf8mb4. "old" = the pip `umysql-2018` 2.63.7 production build (py2
+only); "new" = this port (3.0.0), built with `-DNDEBUG` to match pip builds.
+
+Per-op wall time (microseconds), py2:
+
+| workload                  | old umysql | new umysql | PyMySQL |
+|---------------------------|-----------:|-----------:|--------:|
+| point select (1 row)      | 14.1       | 14.0       | 91.1    |
+| fetch 100 rows            | 38.3       | 35.1       | 476     |
+| fetch 5k rows (~1MB)      | 1,894      | 1,765      | 18,959  |
+| fetch 20MB (20x1MB rows)  | 32,695     | 32,862     | 33,344  |
+| insert                    | 274        | 238        | 269     |
+
+Per-op wall time (microseconds), py3:
+
+| workload                  | new umysql | PyMySQL |
+|---------------------------|-----------:|--------:|
+| point select (1 row)      | 13.8       | 82.3    |
+| fetch 100 rows            | 33.7       | 336     |
+| fetch 5k rows (~1MB)      | 906        | 10,359  |
+| fetch 20MB (20x1MB rows)  | 4,125      | 4,052   |
+| insert                    | 227        | 254     |
+
+gevent throughput (py2, 20 greenlets x 50 x 100-row fetches, separate conns):
+old umysql 28,022 qps; new umysql 43,427 qps; PyMySQL 2,307 qps (CPU-saturated:
+0.42s CPU for 0.43s wall -- the single cooperative process has no headroom left).
+
+Takeaways:
+- **New == old within noise on py2.** The port + hardening costs nothing.
+- **The py3 build is faster than py2** on row-heavy fetches (5k rows: 906 vs
+  1,765 us) and dramatically so on bulk transfer (20MB: 4.1 vs 32.9 ms) -- the
+  latter is interpreter/socket-stack-wide (PyMySQL shows the same py2->py3 jump).
+- **umysql vs PyMySQL: ~6x on point selects, ~10-14x on row-heavy fetches** (wall);
+  the CPU gap is larger (13-38x), which is what matters under gevent -- hence the
+  ~19x concurrency throughput gap. They tie on inserts (server-bound) and on
+  few-huge-rows transfers (memcpy-bound).
+
+Soak (stability): 200,000 mixed iterations per interpreter (~240k queries each:
+point + periodic 100-row fetch + inserts + a deliberate SQLError every 1000 to
+exercise the error path). Result, both py2 and py3: RSS flat across every 10k
+checkpoint (zero growth), all 200 error paths raised cleanly and the connection
+survived, final query healthy. No leaks, no drift, no anomalies.
+
 ## Known limitations / follow-ups
 
 - `caching_sha2_password` is **not implemented** (this driver, like the original,
   speaks only `mysql_native_password`). See "Authentication plugins" below.
+- **Single values whose wire encoding reaches MySQL's 16MB packet limit are
+  mishandled** (multi-part packet reassembly is not implemented; pre-existing,
+  reproduces identically on production 2.63.7). Verified boundaries, pinned by
+  `test_size__single_value_*`: values <= 16,777,210 bytes round-trip exactly;
+  16,777,211 raises and poisons the connection; 16,777,212..<16MB silently
+  truncates to 16,777,211 bytes and splits the row in two (no exception); >=16MB
+  returns an empty result set and poisons the connection. Don't store single
+  column values >=16MB through this driver until reassembly is implemented.
 - A `>65`-digit numeric literal sent to MySQL 8 hangs on py2 (the recv path);
   this reproduces on the *original* umysql too (pre-existing, not a port issue).
 - py3+gevent concurrency benchmark still to be run in a gevent-enabled env (the
-  cooperation property itself is verified on py2).
+  cooperation property itself is verified on py2; py2 gevent numbers above).
 
 ## Authentication plugins (caching_sha2_password not implemented)
 

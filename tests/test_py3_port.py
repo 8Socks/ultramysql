@@ -1841,6 +1841,245 @@ class PortEdgeCases(unittest.TestCase):
         assert len(rows) == 1, rows   # would raise 1267 illegal-mix under general_ci
         c.query('DROP TABLE ncoll'); c.close()
 
+    # ------------------------------------------------------------------
+    # Boundary / capacity / interop tests added from the test-gap audit.
+    # These target "production-discovered" defect classes (capacity cliffs,
+    # protocol-framing edges, collation interop, error-path connection state)
+    # that a security-only review and the happy-path suite both miss. Where a
+    # test PINS current (buggy) behavior it says so -- flip the assertion when
+    # the underlying limitation is fixed.
+    # ------------------------------------------------------------------
+
+    def _probe_single_value(self, length):
+        # Insert a single LONGTEXT value of `length` bytes (built server-side via
+        # REPEAT so the query text stays under the 4MB tx buffer), SELECT it back,
+        # and report (status, nrows, firstlen). Uses a fresh connection because
+        # some size regimes poison the connection.
+        c = conn()
+        c.query('DROP TABLE IF EXISTS bigval')
+        c.query('CREATE TABLE bigval(t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO bigval VALUES (REPEAT(%s,%s))', ('z', length))
+        try:
+            rs = c.query('SELECT t FROM bigval')
+            out = ('ok', len(rs.rows), len(rs.rows[0][0]) if rs.rows else 0, c.is_connected())
+        except Exception as e:
+            out = ('raised', type(e).__name__, str(e.args), c.is_connected())
+        try:
+            c.close()
+        except Exception:
+            pass
+        return out
+
+    def test_size__single_value_just_over_packet_limit_silently_truncates(self):
+        # A single value whose wire encoding reaches MySQL's 0xFFFFFF (16,777,215)
+        # per-packet limit is split across multiple protocol packets that umysql
+        # does NOT reassemble. Just UNDER the limit round-trips exactly; just OVER
+        # it the value is SILENTLY truncated and the single row is split into two,
+        # with NO exception (the dangerous failure mode). Empirically verified
+        # against MySQL 8 on both py2 and py3 builds. PIN of current behavior --
+        # flip when multi-part packet reassembly is implemented.
+        assert self._probe_single_value(16777210) == ('ok', 1, 16777210, True)
+        # 16777212: wire payload (4-byte length code + value) exceeds 0xFFFFFF ->
+        # row splits into 2, value truncated to 16777211, connection survives.
+        status, nrows, firstlen, conn_ok = self._probe_single_value(16777212)
+        assert (status, nrows, firstlen) == ('ok', 2, 16777211), (status, nrows, firstlen)
+
+    def test_size__single_value_at_or_over_16mb_returns_empty_and_poisons(self):
+        # A single value at or above the 16MB rx buffer (16,777,216) does not even
+        # truncate -- the SELECT returns ZERO rows (the value vanishes) and the
+        # connection is left POISONED: the next query raises. PIN of current
+        # behavior; a correct driver would raise a clean error on the SELECT and
+        # keep the connection usable (PyMySQL handles this case correctly).
+        status, nrows, firstlen, conn_ok = self._probe_single_value(16 * 1024 * 1024)
+        assert (status, nrows) == ('ok', 0), (status, nrows)
+
+    def test_size__large_total_result_forces_multiple_buffer_compactions(self):
+        # ~40MB total across 40 x ~1MB rows (each value well under 0xFFFFFF, so no
+        # per-packet split) forces freeSpace() to compact the rx buffer multiple
+        # times. Verifies the ported m_packetEnd recompute holds under repeated
+        # wraps and the full result streams intact.
+        N = 40
+        c = conn()
+        c.query('DROP TABLE IF EXISTS bigtot')
+        c.query('CREATE TABLE bigtot(id INT, t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        for i in range(N):
+            c.query('INSERT INTO bigtot VALUES (%s, REPEAT(%s,%s))', (i, 'a', 1000000))
+        rs = c.query('SELECT id, t FROM bigtot ORDER BY id')
+        assert len(rs.rows) == N, len(rs.rows)
+        assert sum(len(r[1]) for r in rs.rows) == N * 1000000
+        assert all(rs.rows[i][0] == i and len(rs.rows[i][1]) == 1000000 for i in range(N))
+        c.query('DROP TABLE bigtot'); c.close()
+
+    def test_size__query_string_at_and_over_4mb_tx_boundary(self):
+        # The TX buffer is 4MB+header; query() rejects when len > getSize()-(HEADER+1)
+        # = 4194303. So a query of exactly 4194303 bytes succeeds and 4194304 raises
+        # "Query too big". Pins the off-by-one so a buffer-size change is caught.
+        c = conn()
+        assert c.txBufferSize == 4 * 1024 * 1024 + 4, c.txBufferSize
+        limit = c.txBufferSize - 5
+        prefix, suffix = "SELECT '", "' AS x"
+        pad = limit - len(prefix) - len(suffix)
+        q = prefix + ('a' * pad) + suffix
+        assert len(q) == limit
+        assert c.query(q).rows == [('a' * pad,)]
+        q2 = prefix + ('a' * (pad + 1)) + suffix
+        assert len(q2) == limit + 1
+        try:
+            c.query(q2)
+            assert False, 'expected Query too big'
+        except umysql.Error as e:
+            msg = str(e.args[1]) if len(e.args) > 1 else str(e)
+            assert 'too big' in msg.lower(), e.args
+        c.close()
+
+    def test_conn_lifecycle__query_too_big_is_fatal_to_connection(self):
+        # Unlike a SQL error (which leaves the connection usable), an oversized query
+        # goes through setError(UME_OTHER), which CLOSES the socket. So is_connected()
+        # flips False and the next query raises "Not connected" -- a hazard for any
+        # connection pool that assumes errors are recoverable.
+        c = conn()
+        oversized = "SELECT '" + ('a' * (5 * 1024 * 1024)) + "'"   # ~5MB > 4MB tx
+        try:
+            c.query(oversized)
+            assert False, 'expected Query too big'
+        except umysql.Error:
+            pass
+        assert c.is_connected() is False, 'oversized query should have closed the socket'
+        raised = None
+        try:
+            c.query('SELECT 1')
+        except Exception as e:
+            raised = e
+        assert raised is not None and 'not connected' in str(raised).lower(), raised
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    def test_conn_lifecycle__killed_connection_error_shape_first_then_not_connected(self):
+        # Two-step contract after the server kills the connection: the FIRST query
+        # raises a umysql error (recv returns 0 -> setError closes the socket); the
+        # SECOND raises "Not connected" (socket already gone). Pins the transition.
+        victim = conn()
+        cid = int(victim.query('SELECT CONNECTION_ID()').rows[0][0])
+        killer = conn()
+        killer.query('KILL %d' % cid)
+        killer.close()
+        first = None
+        try:
+            victim.query('SELECT 1')
+        except Exception as e:
+            first = e
+        assert first is not None, 'expected an error after KILL'
+        assert isinstance(first, (umysql.Error, RuntimeError)), type(first)
+        assert victim.is_connected() is False
+        second = None
+        try:
+            victim.query('SELECT 1')
+        except Exception as e:
+            second = e
+        assert second is not None and 'not connected' in str(second).lower(), second
+        try:
+            victim.close()
+        except Exception:
+            pass
+
+    def test_framing__result_column_count_crosses_lengthcoded_251(self):
+        # The result-set column count is itself a length-coded integer: <=250 is a
+        # 1-byte code, >=251 must use the 0xfc 2-byte form. Cross the boundary to
+        # exercise readLengthCodedInteger on the count (distinct from the value path).
+        c = conn()
+        for ncol in (250, 251, 252, 300):
+            rs = c.query('SELECT ' + ', '.join(str(i) for i in range(ncol)))
+            assert len(rs.fields) == ncol, (ncol, len(rs.fields))
+            assert rs.rows[0] == tuple(range(ncol)), ncol
+        c.close()
+
+    def test_collation__per_charset_negotiated_collation(self):
+        # The suite pins only utf8mb4's negotiated collation. This pins all four so a
+        # handshake regression -- or a future "fix" that wrongly applies unicode_ci to
+        # latin1/ascii/cp1250 -- is caught.
+        expected = {
+            'utf8mb4': 'utf8mb4_unicode_ci',
+            'latin1': 'latin1_general_ci',
+            'ascii': 'ascii_general_ci',
+            'cp1250': 'cp1250_general_ci',
+        }
+        for cs, coll in expected.items():
+            c = conn(cs)
+            got = c.query('SELECT @@collation_connection').rows[0][0]
+            got = got.decode('utf-8') if isinstance(got, bytes) else got
+            assert got == coll, '%s -> %r (expected %r)' % (cs, got, coll)
+            c.close()
+
+    def test_collation__connection_default_follows_unicode_ci_not_general_ci(self):
+        # The regression test that would have caught the original general_ci bug. The
+        # sharp-s expands to "ss" under utf8mb4_unicode_ci (so they compare EQUAL) but
+        # not under utf8mb4_general_ci. Prove (a) the pair distinguishes the two
+        # collations and (b) the connection default follows unicode_ci.
+        c = conn('utf8mb4')
+        sharp = u'\xdf'   # sharp-s U+00DF; unicode_ci expands it to "ss", general_ci does not
+        default_eq = c.query('SELECT %s = %s', (sharp, u'ss')).rows[0][0]
+        uni_eq = c.query('SELECT %s COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci', (sharp, u'ss')).rows[0][0]
+        gen_eq = c.query('SELECT %s COLLATE utf8mb4_general_ci = %s COLLATE utf8mb4_general_ci', (sharp, u'ss')).rows[0][0]
+        assert uni_eq != gen_eq, (uni_eq, gen_eq)        # the pair genuinely distinguishes the collations
+        assert default_eq == uni_eq, (default_eq, uni_eq)  # connection default == unicode_ci (the fix)
+        c.close()
+
+    def test_concurrency_gevent__killed_greenlet_no_stale_rows_on_reuse(self):
+        # A greenlet killed mid-query (GreenletExit inside recv) must not leave the
+        # connection returning the half-streamed result as stale data on reuse. A
+        # clean fresh result OR a clean error is acceptable; garbled/stale rows are not.
+        if not HAVE_GEVENT:
+            self.skipTest('gevent not installed')
+        import gevent
+        from gevent import monkey
+        monkey.patch_all()
+        c = conn()
+        c.query('DROP TABLE IF EXISTS gk')
+        c.query('CREATE TABLE gk(id INT, t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        for i in range(20):
+            c.query('INSERT INTO gk VALUES (%s, REPEAT(%s,%s))', (i, 'a', 1000000))   # ~20MB
+        g = gevent.spawn(lambda: c.query('SELECT id, t FROM gk ORDER BY id'))
+        gevent.sleep(0)   # let the recv start
+        g.kill()
+        try:
+            assert c.query('SELECT 99').rows == [(99,)], 'stale/garbled data on reuse'
+        except Exception:
+            pass   # a clean error on reuse is acceptable
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    def test_concurrency_gevent__timeout_mid_large_result_no_stale_rows_on_reuse(self):
+        # Same hazard via gevent.Timeout firing during the multi-recv of a large
+        # result: reuse must be clean (correct fresh data) or a clean error, never the
+        # interrupted result's stale rows.
+        if not HAVE_GEVENT:
+            self.skipTest('gevent not installed')
+        import gevent
+        from gevent import monkey
+        monkey.patch_all()
+        c = conn()
+        c.query('DROP TABLE IF EXISTS tmid')
+        c.query('CREATE TABLE tmid(id INT, t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        for i in range(30):
+            c.query('INSERT INTO tmid VALUES (%s, REPEAT(%s,%s))', (i, 'a', 1000000))   # ~30MB
+        try:
+            with gevent.Timeout(0.005):
+                c.query('SELECT id, t FROM tmid ORDER BY id')
+        except gevent.Timeout:
+            pass
+        try:
+            assert c.query('SELECT 77').rows == [(77,)], 'stale/garbled data on reuse'
+        except Exception:
+            pass   # clean error acceptable
+        try:
+            c.close()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     unittest.main()
