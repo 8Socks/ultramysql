@@ -1613,6 +1613,107 @@ class PortEdgeCases(unittest.TestCase):
         c.close()
 
 
+    def test_robust__connection_survives_sql_error(self):
+        # Pooled connections are REUSED after a query error; a transient SQL error
+        # must not poison the connection.
+        c = conn()
+        try:
+            c.query('SELEC bad syntax')
+        except umysql.SQLError:
+            pass
+        assert c.query('SELECT 1').rows == [(1,)]
+        c.query('DROP TABLE IF EXISTS rerr')
+        c.query('CREATE TABLE rerr(id INT PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO rerr VALUES (1)')
+        try:
+            c.query('INSERT INTO rerr VALUES (1)')   # duplicate key
+        except umysql.SQLError:
+            pass
+        assert c.query('SELECT COUNT(*) FROM rerr').rows == [(1,)]   # conn still usable
+        c.query('DROP TABLE rerr'); c.close()
+
+    def test_robust__on_duplicate_key_rowcount(self):
+        # db.py Model.put uses ON DUPLICATE KEY UPDATE and reads rc[0]; pin the
+        # MySQL affected-rows convention (insert=1, update-via-dup=2, unchanged=0).
+        c = conn()
+        c.query('DROP TABLE IF EXISTS odk')
+        c.query('CREATE TABLE odk(id INT PRIMARY KEY, v INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        rc = c.query('INSERT INTO odk VALUES (1,10) ON DUPLICATE KEY UPDATE v=VALUES(v)')
+        assert rc[0] == 1, rc
+        rc = c.query('INSERT INTO odk VALUES (1,20) ON DUPLICATE KEY UPDATE v=VALUES(v)')
+        assert rc[0] == 2, rc   # existing row changed -> 2
+        # NOTE: the driver copies the server capability flags incl. CLIENT_FOUND_ROWS,
+        # so a no-op update reports affected-rows = 1 (matched), NOT 0 (changed-rows
+        # semantics would give 0). This matches the original umysql.
+        rc = c.query('INSERT INTO odk VALUES (1,20) ON DUPLICATE KEY UPDATE v=VALUES(v)')
+        assert rc[0] == 1, rc
+        c.query('DROP TABLE odk'); c.close()
+
+    def test_robust__query_on_killed_connection(self):
+        # The production reconnect path: a server-killed connection must raise on
+        # the next query (db.py catches RuntimeError('Not connected') and retries),
+        # and a fresh connection must work.
+        import time
+        c = conn()
+        cid = c.query('SELECT CONNECTION_ID()').rows[0][0]
+        k = conn(); k.query('KILL %s', (cid,)); k.close()
+        time.sleep(0.2)
+        raised = False
+        try:
+            c.query('SELECT 1')
+        except (RuntimeError, umysql.SQLError, umysql.Error):
+            raised = True
+        assert raised, 'query on a killed connection should raise'
+        try:
+            c.close()
+        except Exception:
+            pass
+        c2 = conn(); assert c2.query('SELECT 1').rows == [(1,)]; c2.close()
+
+    def test_robust__datetime_microseconds_truncated(self):
+        # KNOWN behavior: the decoder hard-codes microsecond=0, so DATETIME(6)
+        # fractional seconds are LOST. Pin it so a future change is noticed.
+        import datetime
+        c = conn()
+        c.query('DROP TABLE IF EXISTS dtus')
+        c.query('CREATE TABLE dtus(dt datetime(6)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query("INSERT INTO dtus VALUES ('2024-06-15 12:30:45.123456')")
+        dt = c.query('SELECT dt FROM dtus').rows[0][0]
+        assert isinstance(dt, datetime.datetime), type(dt)
+        assert dt.microsecond == 0, dt.microsecond   # truncated
+        assert dt == datetime.datetime(2024, 6, 15, 12, 30, 45)
+        c.query('DROP TABLE dtus'); c.close()
+
+    def test_robust__large_text_crosses_length_codes(self):
+        # TEXT values across the length-coded-binary thresholds (1/2/3-byte codes)
+        # and the chunked recv path must round-trip exactly.
+        c = conn()
+        c.query('DROP TABLE IF EXISTS bigtxt')
+        c.query('CREATE TABLE bigtxt(id INT, t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        for n in (250, 251, 65535, 65536, 70000, 1000000):
+            sx = 'x' * n
+            c.query('DELETE FROM bigtxt')
+            c.query('INSERT INTO bigtxt VALUES (1, %s)', (sx,))
+            got = c.query('SELECT t FROM bigtxt WHERE id=1').rows[0][0]
+            gs = got.decode('utf-8') if isinstance(got, bytes) else got
+            assert len(gs) == n, (n, len(gs))
+        c.query('DROP TABLE bigtxt'); c.close()
+
+    def test_robust__stored_proc_call_conn_not_poisoned(self):
+        # A CALL returns a result set followed by an extra OK packet (multi-result).
+        # Whatever the driver does with the result, the connection MUST remain
+        # usable for the next query (no stale-packet poisoning).
+        c = conn()
+        c.query('DROP PROCEDURE IF EXISTS sp_one')
+        c.query('CREATE PROCEDURE sp_one() BEGIN SELECT 7 AS a; END')
+        try:
+            c.query('CALL sp_one()')
+        except umysql.Error:
+            pass
+        assert c.query('SELECT 42').rows == [(42,)], 'connection poisoned after CALL'
+        c.query('DROP PROCEDURE IF EXISTS sp_one'); c.close()
+
+
 
 if __name__ == "__main__":
     unittest.main()
