@@ -51,26 +51,24 @@ jobs:
       - name: Build cp27 wheels in manylinux2014 (direct, cibuildwheel 1.x is too bitrotten)
         run: |
           mkdir -p wheelhouse
-          # Pinned tag: the last manylinux2014 builds that still ship CPython 2.7.
-          docker run --rm -v "$PWD":/io -w /io \
-            quay.io/pypa/manylinux2014_${{ matrix.arch }}:2021-05-01-28d233a \
-            bash -c '
-              set -ex
-              mkdir -p /tmp/w
-              for PY in cp27-cp27mu cp27-cp27m; do
-                "/opt/python/$PY/bin/pip" install -q wheel setuptools
-                "/opt/python/$PY/bin/pip" wheel /io --no-deps -w /tmp/w
-              done
-              for whl in /tmp/w/*.whl; do auditwheel repair "$whl" -w /io/wheelhouse; done
-              ls -l /io/wheelhouse
-            '
-      - name: Smoke-test the cp27mu wheel imports
-        if: matrix.arch == 'x86_64'
-        run: |
-          docker run --rm -v "$PWD":/io \
-            quay.io/pypa/manylinux2014_x86_64:2021-05-01-28d233a bash -c '
-              "/opt/python/cp27-cp27mu/bin/pip" install /io/wheelhouse/*cp27mu*.whl &&
-              "/opt/python/cp27-cp27mu/bin/python" -c "import umysql; print(umysql.__version__)"'
+          IMG=quay.io/pypa/manylinux2014_${{ matrix.arch }}:2021-05-01-28d233a
+          docker run --rm -v "$PWD":/io -w /io "$IMG" bash -c '
+            set -e
+            echo "=== /opt/python in this image ==="; ls -1 /opt/python || true
+            mkdir -p /tmp/w; found=0
+            for PYBIN in /opt/python/cp27-*/bin; do
+              [ -x "$PYBIN/pip" ] || continue
+              found=1; echo "=== building with $PYBIN ==="
+              "$PYBIN/pip" install -q wheel setuptools || true
+              "$PYBIN/pip" wheel /io --no-deps -w /tmp/w
+            done
+            if [ "$found" = 0 ]; then echo "NO cp27 python found in image"; exit 3; fi
+            for whl in /tmp/w/*.whl; do auditwheel repair "$whl" -w /io/wheelhouse; done
+            echo "=== built wheels ==="; ls -l /io/wheelhouse
+            FIRST=$(ls /io/wheelhouse/*.whl | head -1)
+            CP=$(ls /opt/python/cp27-*/bin/python | head -1)
+            "$CP" -m pip install "$FIRST" && "$CP" -c "import umysql; print(umysql.__version__)"
+          '
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-cp27-${{ matrix.arch }}
