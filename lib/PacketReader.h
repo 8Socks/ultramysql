@@ -86,6 +86,7 @@ public:
   size_t getSize();
   bool havePacket();
   bool overflowed();
+  void freeSpace();
 
   UINT8 readByte();
   UINT16 readShort();

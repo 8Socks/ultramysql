@@ -97,6 +97,23 @@ void PacketReader::skip()
   }
 }
 
+void PacketReader::freeSpace()
+{
+  // Compact: move the not-yet-read bytes to the front of the buffer so the space
+  // occupied by already-consumed packets is reclaimed. Without this, a result set
+  // larger than the rx buffer raises a spurious "Socket receive buffer full"
+  // (ported from ngandhy/ultramysql 2.63.7; the m_packetEnd recompute is fixed
+  // here -- the original used m_buffStart, producing a negative offset).
+  size_t len = m_writeCursor - m_readCursor;
+  memmove (m_buffStart, m_readCursor, len);
+
+  if (m_packetEnd != NULL)
+    m_packetEnd = m_buffStart + (m_packetEnd - m_readCursor);
+
+  m_writeCursor = m_buffStart + len;
+  m_readCursor = m_buffStart;
+}
+
 void PacketReader::push(size_t _cbData)
 {
   //fprintf (stderr, "%s: Pushing %u bytes\n", __FUNCTION__, _cbData);

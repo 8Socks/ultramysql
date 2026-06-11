@@ -143,9 +143,17 @@ bool Connection::readSocket()
 
   if (bytesToRecv == 0)
   {
-    // Socket buffer got full!
-    setError("Socket receive buffer full", 0, UME_OTHER);
-    return false;
+    // The write cursor reached the buffer end while earlier packets have already
+    // been consumed -- compact the buffer to reclaim that space and retry. Only a
+    // genuinely full buffer (a single value larger than the whole rx buffer) still
+    // errors. Fixes the "Socket receive buffer full" exception on results > 16MB.
+    m_reader.freeSpace();
+    bytesToRecv = m_reader.getEndPtr() - m_reader.getWritePtr();
+    if (bytesToRecv == 0)
+    {
+      setError("Socket receive buffer full", 0, UME_OTHER);
+      return false;
+    }
   }
   else
     if (bytesToRecv > 65536)

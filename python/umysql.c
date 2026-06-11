@@ -905,7 +905,10 @@ PyObject *Connection_connect(Connection *self, PyObject *args)
           else
             if (strcmp (pstrCharset, "utf8mb4") == 0)
             {
-              self->charset = MCS_utf8mb4_general_ci;
+              /* unicode_ci (224), not general_ci (45): match utf8mb4_unicode_ci
+                 tables so literal/column comparisons don't raise "illegal mix of
+                 collations" (ported from ngandhy/ultramysql 2.63.7). */
+              self->charset = MCS_utf8mb4_unicode_ci;
               self->charset_name = "utf-8";
             }
             else

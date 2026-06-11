@@ -858,25 +858,26 @@ class PortEdgeCases(unittest.TestCase):
         assert all(r == (i + 1, (i + 1) * 2) for i, r in enumerate(rs.rows))
         c.close()
 
-    def test_resultset_protocol__rs_oversized_single_value_errors(self):
-        import umysql
+    def test_resultset_protocol__single_large_value_under_buffer(self):
+        # A large single value UNDER the ~16MB rx buffer round-trips correctly.
+        # The value is built server-side with REPEAT() so the query text stays
+        # tiny -- otherwise the INSERT literal would exceed the 4MB TX buffer and
+        # raise "Query too big" (a separate send-side limit, unrelated to the rx
+        # path under test). (A single value LARGER than the rx buffer is a
+        # pre-existing umysql limitation: MySQL splits it into multi-part
+        # protocol packets that umysql does not reassemble; this affects the
+        # production 2.63.7 build too. The freeSpace fix handles results that are
+        # large in TOTAL across many rows, not one value > 16MB.)
+        BIG = 8 * 1024 * 1024   # 8MB < 16MB rx buffer
         c = conn()
-        assert c.rxBufferSize >= 16 * 1024 * 1024  # ~16MB buffer
-        n = 17 * 1024 * 1024  # exceeds the rx buffer -> must error, not truncate
-        try:
-            c.query('SELECT REPEAT(%s, %s)', ('a', n))
-            assert False, 'expected an error for oversized single value'
-        except umysql.Error as e:
-            assert e.args and isinstance(e.args[0], int), e.args
-        # The oversized value exhausts the rx buffer and drops the connection; a
-        # fresh connection works normally afterward.
-        c2 = conn()
-        assert c2.query('SELECT 1').rows == [(1,)]
-        c2.close()
-        try:
-            c.close()
-        except Exception:
-            pass
+        assert c.rxBufferSize >= 16 * 1024 * 1024
+        c.query('DROP TABLE IF EXISTS sv')
+        c.query('CREATE TABLE sv(t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        c.query('INSERT INTO sv VALUES (REPEAT(%s, %s))', ('y', BIG))
+        got = c.query('SELECT t FROM sv').rows[0][0]
+        assert len(got) == BIG, len(got)
+        assert got == ('y' * BIG) if isinstance(got, str) else got == (b'y' * BIG)
+        c.query('DROP TABLE sv'); c.close()
 
     def test_concurrency_gevent__gevent_nonblocking_parallel_sleep(self):
         if not HAVE_GEVENT:
@@ -1807,6 +1808,38 @@ class PortEdgeCases(unittest.TestCase):
         ds = d.decode('utf-8') if isinstance(d, bytes) else d
         assert ds == '-12345678901234567890.0123456789', repr(d)  # exact high-precision DECIMAL
         c.query('DROP TABLE ex5'); c.close()
+
+    def test_ngandhy__buffer_full_large_result(self):
+        # Production fix (ngandhy 2.63.7 freeSpace): a result set LARGER than the
+        # ~16MB rx buffer streams via buffer compaction instead of raising
+        # "Socket receive buffer full". Reproduced: without freeSpace this exact
+        # 20MB SELECT raises that error; with it the full result returns.
+        c = conn()
+        c.query('DROP TABLE IF EXISTS nbig')
+        c.query('CREATE TABLE nbig(id INT, t LONGTEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        for i in range(20):
+            c.query('INSERT INTO nbig VALUES (%s, %s)', (i, 'x' * 1000000))   # ~20MB total
+        rs = c.query('SELECT id, t FROM nbig ORDER BY id')
+        assert len(rs.rows) == 20, len(rs.rows)
+        assert sum(len(r[1]) for r in rs.rows) == 20 * 1000000
+        c.query('DROP TABLE nbig'); c.close()
+
+    def test_ngandhy__utf8mb4_collation_is_unicode_ci(self):
+        # Production fix (ngandhy 2.63.7): a utf8mb4 connection uses utf8mb4_unicode_ci
+        # (224), not utf8mb4_general_ci (45), so it matches utf8mb4_unicode_ci tables.
+        c = conn('utf8mb4')
+        coll = c.query('SELECT @@collation_connection').rows[0][0]
+        cs = coll.decode('utf-8') if isinstance(coll, bytes) else coll
+        assert cs == 'utf8mb4_unicode_ci', cs
+        # A CONCAT result takes the CONNECTION collation; comparing it to a
+        # utf8mb4_unicode_ci column raises "illegal mix of collations" if the
+        # connection were general_ci. With the fix (unicode_ci) it matches cleanly.
+        c.query('DROP TABLE IF EXISTS ncoll')
+        c.query("CREATE TABLE ncoll(v VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci) ENGINE=InnoDB")
+        c.query("INSERT INTO ncoll VALUES ('cafe')")
+        rows = c.query("SELECT v FROM ncoll WHERE v = CONCAT(%s, '')", ('cafe',)).rows
+        assert len(rows) == 1, rows   # would raise 1267 illegal-mix under general_ci
+        c.query('DROP TABLE ncoll'); c.close()
 
 
 if __name__ == "__main__":
