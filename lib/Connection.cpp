@@ -472,6 +472,11 @@ bool Connection::connect(const char *_host, int _port, const char *_username, co
     return false;
   }
 
+  // Discard any bytes left buffered from a prior aborted read (e.g. the unread
+  // continuation packets after an oversized-result error) so they cannot corrupt
+  // this connection's handshake when the same object is reconnected.
+  m_reader.reset();
+
   m_host = _host ? _host : "localhost";
   m_port = _port ? _port : 3306;
   m_username = _username ? _username : "";
@@ -739,15 +744,29 @@ void *Connection::handleResultPacket(int _fieldCount)
       return NULL;
     }
 
-    // EOF packets start with 0xfe and are short (< 9 bytes). But 0xfe is ALSO the
-    // length-code prefix for an 8-byte (>16MB) column value, which begins a huge
-    // (>= 0xFFFFFF) row packet -- do NOT mistake that for end-of-rows, or the result
-    // set silently ends early. Disambiguate by packet length; an oversized-value row
-    // then proceeds into the read loop, where its over-packet length latches overflow
-    // and fails the query loudly (rather than returning a short result).
     size_t pkt_len = m_reader.getBytesLeft();
+
+    // A row packet of the maximum payload size (0xFFFFFF) is, by the MySQL protocol,
+    // NON-FINAL: the row continues in the next wire packet (a row/value over ~16MB).
+    // This driver does not reassemble multi-part packets, so fail LOUDLY here --
+    // BEFORE parsing any column values. Catching it at the packet level (rather than
+    // when an individual value overruns) is what makes it complete: a 16MB split can
+    // land on a column boundary or inside a length code (which would otherwise yield
+    // a silent NULL + phantom row), and a mid-character UTF-8 truncation would
+    // otherwise bail with a decode error before the value-level overflow check runs.
+    // The connection is closed (the read stream is now desynchronized -- the
+    // continuation packets remain unread).
+    if (pkt_len >= 0xFFFFFF)
+    {
+      setError("Result row too large to read in one packet (rows/values over ~16MB / multi-part packets are not supported)", 0, UME_OTHER);
+      m_capi.destroyResult(resultSet);
+      return NULL;
+    }
+
     UINT8 result = m_reader.readByte();
 
+    // EOF packets start with 0xfe and are short (< 9 bytes). (A 0xfe that is instead
+    // the length-code of a >16MB value lives in a 0xFFFFFF packet, already caught.)
     if (result == 0xfe && pkt_len < 9)
     {
       m_reader.skip();

@@ -283,17 +283,19 @@ independent (Fable) regression-coverage audit and then confirmed empirically.
 
 - `caching_sha2_password` is **not implemented** (this driver, like the original,
   speaks only `mysql_native_password`). See "Authentication plugins" below.
-- **Single column values over ~16MB raise a clear error** (multi-part packet
-  reassembly is not implemented). MySQL splits a value whose wire encoding exceeds
-  the 16MB packet limit (0xFFFFFF = 16,777,215 bytes) across multiple wire packets,
-  which this driver does not reassemble. As of **3.0.1**, reading such a value
-  raises `umysql.Error("Result value too large to read in one packet ...")` and
-  closes the connection -- a loud failure, across both the 4-byte and 8-byte
-  length-code regimes. Values `<= 16,777,210` bytes round-trip exactly. Pinned by
-  `test_size__single_value_over_packet_limit_raises_loudly`.
-  (Earlier 3.0.0 silently truncated values in the 16,777,212..<16MB band and
-  returned an empty result for `>=16MB`; production 2.63.7 silently corrupts or
-  SIGSEGVs on these -- both replaced by the clear error.)
+- **A result row over ~16MB raises a clear error** (multi-part packet reassembly is
+  not implemented). MySQL splits any row whose wire payload reaches the 16MB packet
+  limit (0xFFFFFF = 16,777,215 bytes) across multiple wire packets -- whether from a
+  single oversized column value or several columns summing past the limit. This
+  driver does not reassemble them, so as of **3.0.1** it detects the non-final
+  (0xFFFFFF) row packet and raises `umysql.Error("Result row too large to read in
+  one packet ...")` then closes the connection -- BEFORE parsing any value, so a
+  split landing on a column boundary, inside a length code, or mid-UTF-8-character
+  cannot silently corrupt the result. Rows whose total payload is `< 0xFFFFFF` are
+  unaffected. Pinned by `test_size__single_value_over_packet_limit_raises_loudly`
+  and `test_size__multipart_row_raises_loudly`.
+  (Earlier 3.0.0 silently truncated, or returned phantom rows; production 2.63.7
+  silently corrupts or SIGSEGVs -- both replaced by the clear error.)
 - **A query interrupted mid-recv corrupts the connection.** If a gevent
   `Timeout`/`kill` (or any exception) fires while a result is being received, the
   socket is left desynchronized (the server's remaining bytes are still queued) and

@@ -78,6 +78,7 @@ public:
 
   PacketReader (size_t cbSize);
   ~PacketReader (void);
+  void reset();
   void skip();
   void push(size_t _cbData);
   char *getWritePtr();

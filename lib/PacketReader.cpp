@@ -80,6 +80,18 @@ PacketReader::~PacketReader (void)
   delete[] m_buffStart;
 }
 
+void PacketReader::reset()
+{
+  // Discard any buffered/partial data and return to the freshly-constructed state.
+  // Used when (re)connecting so stale bytes from a prior aborted read (e.g. the
+  // unread continuation packets of an oversized result) cannot corrupt the new
+  // session's handshake.
+  m_writeCursor = m_buffStart;
+  m_readCursor = m_buffStart;
+  m_packetEnd = NULL;
+  m_overflow = false;
+}
+
 void PacketReader::skip()
 {
   assert (m_packetEnd != NULL);

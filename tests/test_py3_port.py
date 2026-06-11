@@ -1880,6 +1880,40 @@ class PortEdgeCases(unittest.TestCase):
             assert 'too large' in args, (n, args)            # the clear, specific error
             assert reuse_ok is False, (n, 'connection should be closed after a loud failure')
 
+    def test_size__multipart_row_raises_loudly(self):
+        # The 16MB packet split can land on a column boundary, inside a length code,
+        # or mid-UTF-8-character -- NOT just inside a single value's payload. Detecting
+        # it at the packet level (a 0xFFFFFF row packet is non-final) catches all of
+        # these BEFORE any value parsing, so none can silently corrupt (truncated
+        # value + phantom row) or bypass the close via a UTF-8 decode error. Each case
+        # below must raise the clear error and close the connection. Build values
+        # server-side with REPEAT to dodge the 4MB tx limit.
+        cases = [
+            "SELECT REPEAT('a', 16777211), 'hi'",                                  # col1 exactly fills the packet
+            "SELECT REPEAT('a', 16777209), REPEAT('b', 70000)",                    # 0xfd length code straddles the split
+            "SELECT 'x', REPEAT('a', 17000000)",                                   # oversized value not in the first column
+            "SELECT REPEAT(CONVERT(X'E282AC' USING utf8mb4), 5592405)",            # utf8mb4 split mid-multibyte-char
+        ]
+        for sql in cases:
+            c = conn()
+            raised = False
+            try:
+                c.query(sql)
+            except umysql.Error as e:
+                raised = 'too large' in (e.args[1] if len(e.args) > 1 else '')
+            # connection must be closed (loud), not left open returning corrupt rows
+            reusable = False
+            try:
+                reusable = (c.query('SELECT 1').rows == [(1,)])
+            except Exception:
+                reusable = False
+            assert raised, ('expected loud error', sql)
+            assert reusable is False, ('connection should be closed', sql)
+            try:
+                c.close()
+            except Exception:
+                pass
+
     def test_size__large_total_result_forces_multiple_buffer_compactions(self):
         # ~40MB total across 40 x ~1MB rows (each value well under 0xFFFFFF, so no
         # per-packet split) forces freeSpace() to compact the rx buffer multiple
