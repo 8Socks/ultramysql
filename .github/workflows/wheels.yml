@@ -38,40 +38,30 @@ jobs:
 
   build_py2:
     name: py2.7 wheel (x86_64)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04   # last Ubuntu LTS that still packages python2.7 in apt
     steps:
       - uses: actions/checkout@v4
-      - name: Build cp27 x86_64 wheel (a frozen manylinux that still ships py2.7)
+      - name: Install Python 2.7 + build tools (per ffcpy copilot-setup recipe)
         run: |
-          mkdir -p wheelhouse
-          built=0
-          # manylinux2014/2010 *latest* dropped py2.7; the older frozen images still
-          # carry cp27. Try each and use the first that has it (x86_64 only -- no
-          # manylinux image ships py2.7 for aarch64).
-          for IMG in \
-            quay.io/pypa/manylinux2010_x86_64:latest \
-            quay.io/pypa/manylinux1_x86_64:latest ; do
-            echo "### trying $IMG"
-            docker pull -q "$IMG" || { echo "pull failed"; continue; }
-            HASCP27=$(docker run --rm "$IMG" bash -c 'ls -d /opt/python/cp27-* 2>/dev/null | head -1 || true')
-            echo "cp27 in image: ${HASCP27:-<none>}"
-            [ -n "$HASCP27" ] || continue
-            docker run --rm -v "$PWD":/io -w /io "$IMG" bash -c '
-              set -e
-              mkdir -p /tmp/w
-              for PYBIN in /opt/python/cp27-*/bin; do
-                echo "=== building with $PYBIN ==="
-                "$PYBIN/pip" wheel /io --no-deps -w /tmp/w
-              done
-              for whl in /tmp/w/*.whl; do auditwheel repair "$whl" -w /io/wheelhouse; done
-              CP=$(ls /opt/python/cp27-*/bin/python | head -1)
-              "$CP" -m pip install /io/wheelhouse/*.whl
-              "$CP" -c "import umysql; print(umysql.__version__)"
-            '
-            built=1; break
-          done
-          [ "$built" = 1 ] || { echo "FAILED: no manylinux image with cp27 available"; exit 1; }
-          echo "=== cp27 wheels ==="; ls -l wheelhouse
+          sudo apt-get update
+          sudo apt-get install -y python2.7 python2.7-dev build-essential patchelf
+          curl -sS https://bootstrap.pypa.io/pip/2.7/get-pip.py -o /tmp/get-pip.py
+          sudo python2.7 /tmp/get-pip.py
+          python2.7 -m pip install "setuptools<45" "wheel<0.34"
+      - name: Build cp27 wheel, then auditwheel-repair to a manylinux tag for PyPI
+        run: |
+          mkdir -p raw wheelhouse
+          python2.7 -m pip wheel . --no-deps -w raw
+          echo "=== raw (linux_x86_64) wheel ==="; ls -l raw
+          # auditwheel runs on py3, bundles libstdc++, and retags to manylinux_2_XX
+          # (the runner's glibc) so PyPI accepts it -- a bare linux_x86_64 tag is rejected.
+          python3 -m pip install --user auditwheel
+          for whl in raw/*.whl; do python3 -m auditwheel repair "$whl" -w wheelhouse; done
+          echo "=== manylinux wheel ==="; ls -l wheelhouse
+      - name: Smoke-test import under python2.7
+        run: |
+          python2.7 -m pip install wheelhouse/*.whl
+          python2.7 -c "import umysql; print(umysql.__version__)"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-cp27-x86_64
