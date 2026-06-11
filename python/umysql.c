@@ -1642,7 +1642,7 @@ static PyObject *umysql_module_init(void)
 
   /* 3.x = the Python 3 port (py3 support + security hardening + JSON decode).
      Queryable at runtime so it is obvious which build is loaded. */
-  PyModule_AddStringConstant(m, "__version__", "3.0.0");
+  PyModule_AddStringConstant(m, "__version__", "3.0.1");
 
   return m;
 }

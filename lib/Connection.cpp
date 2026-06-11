@@ -739,9 +739,16 @@ void *Connection::handleResultPacket(int _fieldCount)
       return NULL;
     }
 
+    // EOF packets start with 0xfe and are short (< 9 bytes). But 0xfe is ALSO the
+    // length-code prefix for an 8-byte (>16MB) column value, which begins a huge
+    // (>= 0xFFFFFF) row packet -- do NOT mistake that for end-of-rows, or the result
+    // set silently ends early. Disambiguate by packet length; an oversized-value row
+    // then proceeds into the read loop, where its over-packet length latches overflow
+    // and fails the query loudly (rather than returning a short result).
+    size_t pkt_len = m_reader.getBytesLeft();
     UINT8 result = m_reader.readByte();
 
-    if (result == 0xfe)
+    if (result == 0xfe && pkt_len < 9)
     {
       m_reader.skip();
       break;
@@ -764,9 +771,15 @@ void *Connection::handleResultPacket(int _fieldCount)
       }
     }
 
-    // A length-coded value that ran past the packet latches the overflow flag.
+    // A length-coded value that ran past the packet latches the overflow flag --
+    // an oversized value (a single column over ~16MB, split across wire packets,
+    // which this driver does not reassemble) or a malformed packet. Fail LOUDLY
+    // with a clear error rather than returning a silently-truncated row, and close
+    // the connection (the read stream is now desynchronized -- continuation packets
+    // remain unread, so the connection cannot be safely reused).
     if (m_reader.overflowed())
     {
+      setError("Result value too large to read in one packet (single values over ~16MB / multi-part packets are not supported)", 0, UME_OTHER);
       m_capi.destroyResult(resultSet);
       return NULL;
     }

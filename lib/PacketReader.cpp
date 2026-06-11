@@ -294,7 +294,10 @@ UINT8 *PacketReader::readLengthCodedBinary(size_t *_outLen)
     break;
 
   case 253:
-    if (m_readCursor + 4 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
+    // The UINT32 load reads 4 bytes starting after the marker (cursor+1..cursor+4),
+    // so 5 bytes from the marker must be in-packet (the 4th length byte is masked
+    // off below but is still physically read). Bound to +5 to avoid a 1-byte over-read.
+    if (m_readCursor + 5 > m_packetEnd) { m_readCursor = m_packetEnd; *_outLen = 0; return NULL; }
     m_readCursor ++;
     *_outLen = (size_t) *((UINT32 *) m_readCursor);
     *_outLen &= 0xffffff;
@@ -309,12 +312,18 @@ UINT8 *PacketReader::readLengthCodedBinary(size_t *_outLen)
     break;
   }
 
-  // Clamp the payload length to the bytes actually remaining in the packet, so
-  // the returned (pointer, length) can never reference memory past m_packetEnd.
+  // The value's length-coded size must fit within the bytes remaining in this
+  // packet. If it does not, the value is split across multiple wire packets (a
+  // single value over ~16MB, which this driver does not reassemble) or the packet
+  // is malformed. Latch overflow so the result loop fails the query LOUDLY with a
+  // clear error rather than returning a silently-truncated value; still bound the
+  // read to the packet so the returned (pointer, length) never references memory
+  // past m_packetEnd.
   {
     size_t avail = (size_t) (m_packetEnd - m_readCursor);
     if (*_outLen > avail)
     {
+      m_overflow = true;
       *_outLen = avail;
     }
   }

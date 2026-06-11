@@ -1861,35 +1861,24 @@ class PortEdgeCases(unittest.TestCase):
             pass
         return out + (reuse_ok,)
 
-    def test_size__single_value_just_over_packet_limit_silently_truncates(self):
-        # A single value whose wire encoding reaches MySQL's 0xFFFFFF (16,777,215)
-        # per-packet limit is split across multiple protocol packets that umysql
-        # does NOT reassemble. Just UNDER the limit round-trips exactly; just OVER
-        # it the value is SILENTLY truncated and the single row is split into two,
-        # with NO exception (the dangerous failure mode). Empirically verified
-        # against MySQL 8 on both py2 and py3 builds. PIN of current behavior --
-        # flip when multi-part packet reassembly is implemented.
-        # Just under the limit: exact round-trip, connection reusable.
+    def test_size__single_value_over_packet_limit_raises_loudly(self):
+        # A single column value whose wire encoding exceeds MySQL's 16MB packet
+        # limit (0xFFFFFF = 16,777,215) is split across multiple wire packets, which
+        # this driver does NOT reassemble. Rather than silently truncating the value
+        # or returning an empty result (the old dangerous behavior), the driver now
+        # RAISES a clear umysql.Error and closes the connection -- loud failure, no
+        # silent data loss. Verified on MySQL 8 across the 0xfd (4-byte) and 0xfe
+        # (8-byte) length-code regimes, py2 and py3.
+        # Just under the limit: exact round-trip, connection stays usable.
         assert self._probe_single_value(16777210) == ('ok', 1, 16777210, True)
-        # Exactly at 0xFFFFFF (4-byte length code + value == 16,777,215): the driver
-        # mis-frames it -- raises AND poisons the connection (not reusable).
-        status, _, _, reuse_ok = self._probe_single_value(16777211)
-        assert status == 'raised', status
-        assert reuse_ok is False, 'expected the connection to be poisoned'
-        # Just over: wire payload exceeds 0xFFFFFF -> row splits into 2, value silently
-        # truncated to 16,777,211, but the connection survives and is reusable.
-        status, nrows, firstlen, reuse_ok = self._probe_single_value(16777212)
-        assert (status, nrows, firstlen, reuse_ok) == ('ok', 2, 16777211, True), (status, nrows, firstlen, reuse_ok)
-
-    def test_size__single_value_at_or_over_16mb_returns_empty_and_poisons(self):
-        # A single value at or above the 16MB rx buffer (16,777,216) does not even
-        # truncate -- the SELECT returns ZERO rows (the value vanishes) and the
-        # connection is left POISONED: the next query raises. PIN of current
-        # behavior; a correct driver would raise a clean error on the SELECT and
-        # keep the connection usable (PyMySQL handles this case correctly).
-        status, nrows, _, reuse_ok = self._probe_single_value(16 * 1024 * 1024)
-        assert (status, nrows) == ('ok', 0), (status, nrows)
-        assert reuse_ok is False, 'expected the connection to be poisoned'
+        # At/over the limit, in BOTH length-code regimes (16777211-16777215 use a
+        # 4-byte code; >=16777216 use an 8-byte code): every size raises loudly with
+        # the clear message and closes the connection (not truncated, not empty).
+        for n in (16777211, 16777212, 17 * 1000 * 1000, 16 * 1024 * 1024):
+            status, exc, args, reuse_ok = self._probe_single_value(n)
+            assert status == 'raised', (n, status, exc, args)
+            assert 'too large' in args, (n, args)            # the clear, specific error
+            assert reuse_ok is False, (n, 'connection should be closed after a loud failure')
 
     def test_size__large_total_result_forces_multiple_buffer_compactions(self):
         # ~40MB total across 40 x ~1MB rows (each value well under 0xFFFFFF, so no
