@@ -48,19 +48,29 @@ jobs:
       - name: Set up QEMU (cross-arch)
         if: matrix.arch == 'aarch64'
         uses: docker/setup-qemu-action@v3
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.8'   # host interpreter that RUNS cibuildwheel 1.x
-      - name: Build cp27 wheels (last py2.7-capable cibuildwheel)
+      - name: Build cp27 wheels in manylinux2014 (direct, cibuildwheel 1.x is too bitrotten)
         run: |
-          pip install "cibuildwheel==1.12.0"
-          cibuildwheel --output-dir wheelhouse
-        env:
-          CIBW_BUILD: cp27-*
-          CIBW_ARCHS: ${{ matrix.arch }}
-          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
-          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
-          CIBW_TEST_COMMAND: python -c "import umysql; print(umysql.__version__)"
+          mkdir -p wheelhouse
+          # Pinned tag: the last manylinux2014 builds that still ship CPython 2.7.
+          docker run --rm -v "$PWD":/io -w /io \
+            quay.io/pypa/manylinux2014_${{ matrix.arch }}:2021-05-01-28d233a \
+            bash -c '
+              set -ex
+              mkdir -p /tmp/w
+              for PY in cp27-cp27mu cp27-cp27m; do
+                "/opt/python/$PY/bin/pip" install -q wheel setuptools
+                "/opt/python/$PY/bin/pip" wheel /io --no-deps -w /tmp/w
+              done
+              for whl in /tmp/w/*.whl; do auditwheel repair "$whl" -w /io/wheelhouse; done
+              ls -l /io/wheelhouse
+            '
+      - name: Smoke-test the cp27mu wheel imports
+        if: matrix.arch == 'x86_64'
+        run: |
+          docker run --rm -v "$PWD":/io \
+            quay.io/pypa/manylinux2014_x86_64:2021-05-01-28d233a bash -c '
+              "/opt/python/cp27-cp27mu/bin/pip" install /io/wheelhouse/*cp27mu*.whl &&
+              "/opt/python/cp27-cp27mu/bin/python" -c "import umysql; print(umysql.__version__)"'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-cp27-${{ matrix.arch }}
